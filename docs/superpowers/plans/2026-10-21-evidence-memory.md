@@ -29,10 +29,10 @@
 - [x] Backend: memory validation, history pagination, source mutation/deletion behavior.
 - [x] Windows: preference transmission fix, evidence and memory controls, lifecycle/Qt checks.
 - [x] Android: evidence and memory controls, lifecycle/SQLite checks, debug APK build.
-- [ ] iOS: style preservation/editor, evidence and memory controls, shared checks and remote build.
+- [x] iOS: style preservation/editor, evidence and memory controls, shared checks and remote build.
 - [x] Integration: real PocketBase+gateway, source isolation/conflict/deletion regression.
 - [x] Review: independent full-branch review, repair material findings, run required suites.
-- [ ] Delivery: private backup/deployment verification, updated source/build packages and guide.
+- [x] Delivery: private backup/deployment verification, updated source/build packages and guide.
 
 Each implementation task first adds/runs a failing behavioral regression, then implements
 and reruns its relevant suite. Backend and client implementation share only the frozen
@@ -53,6 +53,14 @@ spec; clients do not change server files. Root owns final integration and deploy
   ready check verified. Synthetic three-platform sessions exercised evidence,
   memory correction/history/restore, isolation, deletion and revocation without
   model generation. Provider settings were preserved.
-- iOS latest remote compilation and Windows final archive verification remain
-  delivery gates. Apple distribution signing and actual three-device acceptance
+- Windows archive: clean PyInstaller build, all 36 embedded modules (602 code
+  objects) matched frozen source; all 5,878 ZIP entries passed CRC. No account
+  configuration or provider key is distributed.
+- iOS run39485965448 on c500dca passed 308 Swift checks plus both full simulator
+  and unsigned device builds. The workflow uses the standard `macos-15-intel`
+  pool after a queued arm64 runner. Apple distribution signing and actual
+  three-device acceptance
   are separate, unfinished work; domain/HTTPS is deferred as requested.
+- Delivery archives passed CRC and source inventory checks; the simulator app
+  and its two extensions retained executable permissions and both simulator
+  architectures. Detailed iOS provenance is in `docs/ios-cloud-v2-build.md`.
