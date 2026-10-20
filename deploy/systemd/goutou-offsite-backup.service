@@ -1,0 +1,20 @@
+[Unit]
+Description=Encrypted offsite backup of completed Goutou cold snapshots
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/goutou-offsite-backup
+UMask=0077
+TimeoutStartSec=45min
+TimeoutStopSec=30s
+KillMode=control-group
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=1G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

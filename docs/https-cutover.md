@@ -66,7 +66,11 @@ active afterward; private readiness and external trusted HTTPS checks passed.
 An immediate first readiness probe ran before the gateway had bound its socket;
 a separate follow-up confirmed startup success. The verification helper now
 waits for readiness instead of assuming systemd process-start means ready.
-Backups remain root-only on the same VPS; offsite backup is not implemented.
+At the HTTPS-cutover stage, backups remained root-only on the same VPS and
+offsite backup had not yet been implemented. Update on 2026-10-21: encrypted OSS
+upload, actual download/decryption and same-VPS isolated recovery passed, and
+daily offsite backup is enabled. See [offsite acceptance](offsite-backup.md#verified-deployment--2026-10-21)
+for the evidence and the limits of this recovery test.
 
 Cold backup now pauses an originally-active Caddy and includes configuration/TLS
 storage, then restores original activities after PB/gateway. Fourteen behavior

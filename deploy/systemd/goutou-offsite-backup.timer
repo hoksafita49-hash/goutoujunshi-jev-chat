@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily encrypted Goutou backup after the local cold snapshot
+
+[Timer]
+OnCalendar=*-*-* 04:40:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,31 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["oss:GetBucketLocation"],
+      "Resource": ["acs:oss:*:*:zovoeh-backup-20261021"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["oss:ListObjects"],
+      "Resource": ["acs:oss:*:*:zovoeh-backup-20261021"],
+      "Condition": {
+        "StringLike": {
+          "oss:Prefix": ["goutou-v1/*"]
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:GetObject",
+        "oss:PutObject",
+        "oss:DeleteObject",
+        "oss:AbortMultipartUpload",
+        "oss:ListParts"
+      ],
+      "Resource": ["acs:oss:*:*:zovoeh-backup-20261021/goutou-v1/*"]
+    }
+  ]
+}
