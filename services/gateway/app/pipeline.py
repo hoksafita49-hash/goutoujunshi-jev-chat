@@ -49,8 +49,17 @@ async def run_pipeline(job, complete):
         "尊重拒绝与停止联系，不读心。只输出JSON对象：evidence数组，每项有kind(fact/hypothesis/unknown)、text、"
         "source_quotes数组(每项message_uid和quote，引用必须是输入消息原文的连续片段，不能编造或改写；"
         "背景或记忆推导而无本轮消息出处时留空)。最多每类6项、每项引用尽量短。"
-        "strategy本轮一个主动作、stop_condition停止条件。", context, 1024)
+        "strategy和stop_condition必须是顶层非空字符串，分别是本轮一个主动作和停止条件，不要嵌套对象。"
+        'JSON结构示例：{"evidence":[],"strategy":"先确认时间","stop_condition":"对方拒绝时停止推进"}。', context, 1024)
     strategy = evidence.get("strategy")
+    # The previous prompt allowed a valid JSON strategy object with these two
+    # string fields. Canonicalize only that observed shape before drafting.
+    if (isinstance(strategy, dict) and "stop_condition" not in evidence
+            and set(strategy) == {"action", "stop_condition"}
+            and all(isinstance(strategy[key], str) and strategy[key].strip()
+                    for key in ("action", "stop_condition"))):
+        evidence = dict(evidence, strategy=strategy["action"], stop_condition=strategy["stop_condition"])
+        strategy = evidence["strategy"]
     if not isinstance(strategy, str) or not strategy.strip():
         raise PipelineError("invalid_model_output")
     claims = normalize_evidence(evidence, context.get("messages", []))

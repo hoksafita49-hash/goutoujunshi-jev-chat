@@ -3,6 +3,7 @@
 onedir 不是 onefile：PySide6 + onnxruntime 打出来 ~150MB，onefile 每次启动都要解压一遍，慢且占临时盘。
 只在 Windows 上跑，下面的 collect_all 也只认 Windows 上装好的那几个包。"""
 from PyInstaller.utils.hooks import collect_all
+from pathlib import PureWindowsPath
 
 NAME = "goutoujunshi-jev-chat-windows"
 
@@ -60,6 +61,11 @@ a = Analysis(
     excludes=excludes,
     noarchive=False,
 )
+# Qt's Windows build imports the OS ICU API (ucnv_open, without a version suffix).
+# A build-host Poppler directory on PATH can provide another icuuc.dll exporting
+# only ucnv_open_78; bundling it shadows System32 and makes QtCore fail with error 127.
+# Keep the OS DLL unbundled. Other runtime dependencies remain unchanged.
+a.binaries = [entry for entry in a.binaries if PureWindowsPath(entry[0]).name.casefold() != "icuuc.dll"]
 pyz = PYZ(a.pure)
 
 exe = EXE(

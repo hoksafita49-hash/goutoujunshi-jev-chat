@@ -833,6 +833,7 @@ class Overlay:
         self.relEdit.setText(relationship if _RELATIONSHIPS[index][1] is None else "")
         self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
         self.styleEdit.setText(settings.style())
+        self._cloud_style_baseline = self.styleEdit.text()
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
         self.autoSwitch.setChecked(settings.auto_analyze())
@@ -865,6 +866,11 @@ class Overlay:
         self.profileBackground.setPlainText(str(current["background"]))
         self.settingsFeedback.hide()
 
+    def _refresh_cloud_style(self, *, discard_draft=False):
+        if settings.cloud_mode() and (discard_draft or self.styleEdit.text() == self._cloud_style_baseline):
+            self._cloud_style_baseline = settings.style()
+            self.styleEdit.setText(self._cloud_style_baseline)
+
     def _save_profile(self):
         title = self._shown or self._chat
         try:
@@ -884,10 +890,15 @@ class Overlay:
         relationship = relationship or self.relEdit.text().strip()
         if settings.cloud_mode():
             try:
-                settings.save(relationship, self.contextBox.value(), style_text=self.styleEdit.text().strip(),
+                style = self.styleEdit.text()
+                style_edited = style != self._cloud_style_baseline
+                settings.save(relationship, self.contextBox.value(), style_text=style.strip() if style_edited else None,
                               reply_target_on=self.targetSwitch.isChecked(), auto_analyze_on=self.autoSwitch.isChecked(),
                               target_app_text=profiles.QQ if self.targetAppBox.currentIndex() == 1 else profiles.WECHAT,
                               check_update_on=self.updateSwitch.isChecked())
+                if style_edited:
+                    self._cloud_style_baseline = style
+                self._refresh_cloud_style()
                 if self.on_settings_saved:
                     self.on_settings_saved()
                 self._settings_feedback("云模式偏好已保存；模型配置由服务端管理。")

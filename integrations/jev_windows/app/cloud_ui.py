@@ -151,6 +151,8 @@ class CloudPanel(QWidget):
         if not account_change and not stable:
             self._completion = self._failure = self._run_context = None
             return
+        if not error:
+            self.overlay._refresh_cloud_style(discard_draft=account_change)
         if isinstance(value, dict) and value.get("model_ready") is False:
             self.status.setText(self.status.text() + " · 服务端模型尚未配置，资料同步仍可用")
         if error:

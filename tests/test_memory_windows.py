@@ -215,6 +215,8 @@ class MemoryWindowsQtTests(unittest.TestCase):
         except ImportError:
             raise unittest.SkipTest("Real Qt workflows run in ../windows-venv")
         cls.app = QApplication.instance() or QApplication([])
+        # Keep the library's Qt resource registration alive across test-local module aliases.
+        import qfluentwidgets
 
     def setUp(self):
         MemoryWindowsTests.setUp(self)
@@ -244,7 +246,8 @@ class MemoryWindowsQtTests(unittest.TestCase):
         self.addCleanup(active.stop)
         from PySide6.QtWidgets import QWidget
         self.overlay = SimpleNamespace(settingsPage=QWidget(), win=QWidget(), on_settings_saved=None,
-                                       invalidate_replies=Mock(), reset_chat_state=Mock(), _load_settings=Mock())
+                                       invalidate_replies=Mock(), reset_chat_state=Mock(), _load_settings=Mock(),
+                                       _refresh_cloud_style=Mock())
         self.panel = self.panel_module.CloudPanel(self.overlay)
         self.addCleanup(self.panel.timer.stop)
         self.addCleanup(self.panel.close)
@@ -257,6 +260,78 @@ class MemoryWindowsQtTests(unittest.TestCase):
             time.sleep(.005)
         self.assertFalse(dialog.busy, "A synthetic read should finish without blocking Qt")
         self.app.processEvents()
+
+    def style_overlay(self, initial_style=""):
+        """Build the actual Qt settings page against the synthetic account only."""
+        real_core = importlib.import_module("integrations.jev_windows.core")
+        runtime = module("cloud_runtime")
+        aliases = patch.dict(sys.modules, {"core": real_core, "app.cloud_ui": self.panel_module,
+                                          "app.cloud_runtime": runtime})
+        aliases.start()
+        self.addCleanup(aliases.stop)
+        active = patch.object(runtime, "current", return_value=self.service)
+        active.start()
+        self.addCleanup(active.stop)
+        settings = self.panel_module.settings
+        config = self.root / "settings-test.json"
+        config.write_text('{"connection_mode":"cloud","cloud_server":"https://api.example.test","target_app":"qq","auto_analyze":false}', encoding="utf-8")
+        for name, value in (("_CONFIG", str(config)), ("_get_key", lambda *_args: "")):
+            active = patch.object(settings, name, value)
+            active.start()
+            self.addCleanup(active.stop)
+        preference_uid = "00000000-0000-4000-8000-000000000001"
+        payload = dict(tone="natural", length="short", count=1, style=initial_style, future="retained")
+        self.db.apply_pull([dict(seq=20, record=record("preferences", preference_uid, payload, 1))], "initial-preferences")
+        overlay = module("overlay").Overlay(on_fill=lambda _text: None, result_of=lambda _title: None)
+        self.addCleanup(overlay.win.close)
+        self.addCleanup(overlay.cloudPanel.timer.stop)
+        overlay.open_settings()
+        self.assertEqual(overlay.styleEdit.text(), initial_style)
+        return overlay, preference_uid
+
+    def sync_remote_style(self, overlay, uid, style):
+        payload = dict(tone="natural", length="short", count=1, style=style, future="retained")
+        self.service.gateway = self.gateway
+        def response(method, path, *_args):
+            if path == "/v1/config":
+                return dict(server_epoch="synthetic-style-epoch", api_version=1, min_client_version=1, sync_ready=True)
+            if method == "GET" and path.startswith("/v1/sync/pull"):
+                return dict(server_epoch="synthetic-style-epoch", changes=[dict(seq=21,
+                    record=record("preferences", uid, payload, 2))], cursor="remote-preferences", has_more=False)
+            raise AssertionError("Unexpected synthetic style request: " + method + " " + path)
+        self.gateway.request.side_effect = response
+        overlay.cloudPanel.sync()
+        self.wait_read(overlay.cloudPanel)
+        self.assertEqual(self.db.visible("preferences", uid)["payload"]["style"], style)
+
+    def test_qt_open_settings_refreshes_untouched_style_after_remote_sync(self):
+        overlay, uid = self.style_overlay()
+        self.sync_remote_style(overlay, uid, "Android acceptance: concise, no emoji")
+        self.assertEqual(overlay.styleEdit.text(), "Android acceptance: concise, no emoji")
+        self.assertEqual(self.db.operations(), [])
+
+    def test_qt_remote_sync_preserves_unsaved_local_style_draft(self):
+        overlay, uid = self.style_overlay()
+        overlay.styleEdit.setText("尚未保存的 Windows 草稿")
+        self.sync_remote_style(overlay, uid, "Android changed remotely")
+        self.assertEqual(overlay.styleEdit.text(), "尚未保存的 Windows 草稿")
+        self.assertEqual(self.db.operations(), [])
+
+    def test_qt_save_untouched_stale_empty_style_does_not_clear_remote_preference(self):
+        overlay, uid = self.style_overlay()
+        self.db.apply_pull([dict(seq=21, record=record("preferences", uid,
+            dict(tone="natural", length="short", count=1, style="Remote style", future="retained"), 2))], "remote")
+        overlay._save()
+        self.assertEqual(self.db.visible("preferences", uid)["payload"]["style"], "Remote style")
+        self.assertEqual(self.db.operations(), [])
+
+    def test_qt_explicit_style_clear_preserves_other_remote_preferences(self):
+        overlay, uid = self.style_overlay("Existing style")
+        overlay.styleEdit.setText("")
+        overlay._save()
+        self.assertEqual(self.db.visible("preferences", uid)["payload"],
+                         dict(tone="natural", length="short", count=1, style="", future="retained"))
+        self.assertEqual(self.db.operations()[0]["payload"]["style"], "")
 
     def test_qt_manual_edit_confirm_pending_and_delete_controls_stage_real_operations(self):
         dialog = self.ui.MemoryDialog(self.panel, "p")

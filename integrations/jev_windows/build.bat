@@ -16,6 +16,7 @@ python -m pip install -r requirements.txt pyinstaller || goto :fail
 
 echo Building ...
 pyinstaller --noconfirm --clean jev.spec || goto :fail
+python check_bundle.py || goto :fail
 copy /Y README.md dist\goutoujunshi-jev-chat-windows\README.md >nul || goto :fail
 copy /Y LICENSE dist\goutoujunshi-jev-chat-windows\LICENSE >nul || goto :fail
 copy /Y NOTICE dist\goutoujunshi-jev-chat-windows\NOTICE >nul || goto :fail

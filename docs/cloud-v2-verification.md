@@ -58,3 +58,11 @@ the packaged EXE was not launched against real chats.
 Deletion is not physical secure erase. Offline devices that have not synchronized,
 old exports/screenshots, recovery/conflict copies and prior backups require their
 holders to manage them separately. Backups currently remain on the same VPS.
+
+## Follow-up installed-app acceptance
+
+The later Windows/actual-Android follow-up found and fixed a bundled ICU loading
+failure, an open-form preference refresh issue, and a reproducible provider JSON
+shape mismatch. That follow-up includes real paid generation, rather than only
+fake-provider tests. See [the live acceptance record](windows-android-live-acceptance.md)
+for the separate observations, updated verification counts and remaining limits.
