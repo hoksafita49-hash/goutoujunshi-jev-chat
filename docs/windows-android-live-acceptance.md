@@ -1,5 +1,10 @@
 # Windows and Android live acceptance — 2026-10-21
 
+Historical record from before the HTTPS cutover. The tunnel/USB requirements and
+network limits below describe that earlier run. Daily access now uses
+`https://api.zovoeh.cn`; see the [HTTPS cutover record](https-cutover.md) and the
+user-facing `HTTPS接入与验收记录.txt` for current access and physical-device checks.
+
 This follow-up exercises the packaged Windows EXE and the actual USB-connected
 Android 16 device against the existing PocketBase account and gateway. Only a
 labeled synthetic person and four manually confirmed coffee-planning messages

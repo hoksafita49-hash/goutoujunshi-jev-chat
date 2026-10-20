@@ -1,5 +1,10 @@
 # Cloud v2 verification — 2026-10-21
 
+Historical verification record from before installed-app acceptance and HTTPS
+activation. Its counts and boundaries describe that increment. Daily access now
+uses `https://api.zovoeh.cn`; see the [HTTPS cutover record](https-cutover.md) and
+the user-facing `HTTPS接入与验收记录.txt` for the latest handoff.
+
 This increment uses the existing PocketBase account/sync service and unified
 model gateway. The additive contract is in `contracts/cloud-v2.md`.
 

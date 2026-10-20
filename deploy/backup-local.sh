@@ -8,28 +8,37 @@ flock -n 9 || { echo "A deployment or backup is already in progress." >&2; exit 
 install -d -m 700 /var/backups/goutou
 pb_was_active=0
 gateway_was_active=0
+caddy_was_active=0
+backup_paths=(var/lib/goutou/pocketbase etc/goutou opt/goutou/deployment.json)
 systemctl is-active --quiet goutou-pocketbase && pb_was_active=1
 systemctl is-active --quiet goutou-gateway && gateway_was_active=1
+# Older deployments have no Caddy unit or TLS storage.
+if systemctl cat caddy.service >/dev/null 2>&1; then
+    backup_paths+=(etc/caddy var/lib/caddy)
+    if systemctl is-active --quiet caddy; then caddy_was_active=1; fi
+fi
 partial=""
 restore_services() {
     status=$?
     trap - EXIT
     # A failed current archive is never useful and must not consume remaining disk.
-    if [[ -n "$partial" && -f "$partial" ]]; then rm -f -- "$partial"; fi
+    if [[ -n "$partial" && -f "$partial" ]]; then rm -f -- "$partial" || status=1; fi
     if [[ $pb_was_active -eq 1 ]]; then systemctl start goutou-pocketbase || status=1; fi
     if [[ $gateway_was_active -eq 1 ]]; then systemctl start goutou-gateway || status=1; fi
+    if [[ $caddy_was_active -eq 1 ]]; then systemctl start caddy || status=1; fi
     exit "$status"
 }
 trap restore_services EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# Pause TLS storage writes before taking the cold snapshot.
+if [[ $caddy_was_active -eq 1 ]]; then systemctl stop caddy; fi
 systemctl stop goutou-gateway
 systemctl stop goutou-pocketbase
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 archive="/var/backups/goutou/goutou-${stamp}.tar.gz"
 partial="${archive}.partial"
-tar -czf "$partial" -C / \
-    var/lib/goutou/pocketbase etc/goutou opt/goutou/deployment.json
+tar -czf "$partial" -C / "${backup_paths[@]}"
 tar -tzf "$partial" >/dev/null
 mv "$partial" "$archive"
 partial=""
