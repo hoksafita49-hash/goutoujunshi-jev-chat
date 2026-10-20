@@ -427,6 +427,11 @@ class Overlay:
         self.detailsButton = PushButton("详细分析")
         self.detailsButton.clicked.connect(lambda: self.on_details and self.on_details())
         actions.addWidget(self.detailsButton)
+        self._evidence_result = None
+        self.evidenceButton = PushButton("证据与原文出处")
+        self.evidenceButton.clicked.connect(self._show_evidence)
+        self.evidenceButton.hide()
+        actions.addWidget(self.evidenceButton)
         self.rewriteButton = PushButton("更像我一点")
         self.rewriteButton.clicked.connect(lambda: self.on_rewrite and self.on_rewrite())
         actions.addWidget(self.rewriteButton)
@@ -1107,6 +1112,8 @@ class Overlay:
 
     def invalidate_replies(self):
         self._current = False
+        self._evidence_result = None
+        self.evidenceButton.hide()
         if self.cands:
             self.updated.setText("上次建议")
         for card in self.cards:
@@ -1288,6 +1295,8 @@ class Overlay:
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
+        self._evidence_result = dict(result) if result.get("analysis_id") and result.get("profile_uid") else None
+        self.evidenceButton.setVisible(bool(self._evidence_result) and settings.cloud_mode())
         self.cands = result["candidates"]
         self.set_busy(False)
         self._current = bool(self.cands)
@@ -1326,7 +1335,7 @@ class Overlay:
         self.intent.setText("对方可能的意图 · " + reading.get("intent", _choice(answers, "true_intent")) + confidence_text +
                             "\n可能需要 · " + _choice(answers, "she_needs"))
         facts = reading.get("facts") or []
-        self.evidence.setText("已核对原文\n" + "\n".join(facts) +
+        self.evidence.setText(("模型事实结论（可查看原文出处）\n" if result.get("server_order") else "已核对原文\n") + "\n".join(facts) +
                               "\n仍未知 · " + reading.get("unknown", "") +
                               "\n" + reading.get("evidence_note", "") if reading else "")
         self.nextStep.setText("下一步 · " + reading.get("next_step", "") +
@@ -1348,6 +1357,10 @@ class Overlay:
         else:
             self.set_status("这轮建议不回复；先核对原文和边界。" if reading else
                             "未生成可用回复，请等待下一条新消息。", "warning" if reading else "error")
+
+    def _show_evidence(self):
+        if settings.cloud_mode() and self._evidence_result:
+            self.cloudPanel.show_evidence(self._evidence_result)
 
     def show_details(self, content, heading="详细分析"):
         dialog = QDialog(self.win)

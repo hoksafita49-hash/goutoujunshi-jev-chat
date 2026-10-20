@@ -32,6 +32,13 @@ class LocalDatabase:
         CREATE TABLE IF NOT EXISTS legacy(key TEXT PRIMARY KEY,uid TEXT);
         CREATE TABLE IF NOT EXISTS jobs(request_id TEXT PRIMARY KEY,fingerprint TEXT,body TEXT,job TEXT);
         """)
+        # Upgrade caches that consumed a tombstone before task-copy cleanup existed;
+        # the incremental cursor will not deliver those deletion events again.
+        with self.lock, self.conn:
+            for row in self.conn.execute("SELECT record FROM mirror WHERE kind='analyses'").fetchall():
+                record = json.loads(row["record"])
+                if record.get("deleted_at"):
+                    self._mirror(record)
 
     def close(self):
         with self.lock:
@@ -91,6 +98,19 @@ class LocalDatabase:
 
     def _mirror(self, record):
         old = self._remote(record["entity_type"], record["uid"])
+        if record["entity_type"] == "analyses" and (record.get("deleted_at") or (old or {}).get("deleted_at")):
+            # Analysis deletion is terminal. Historical pages and late job receipts must
+            # not expose a second copy through the durable task/recovery ledger.
+            tombstone = record if record.get("deleted_at") else old
+            record = {**tombstone, "version": max(record["version"], (old or {}).get("version", 0)), "payload": {}}
+            for row in self.conn.execute("SELECT request_id,body,job FROM jobs").fetchall():
+                job = json.loads(row["job"])
+                body = json.loads(row["body"])
+                if (job.get("analysis_id") == record["uid"] or (job.get("result") or {}).get("analysis_id") == record["uid"] or
+                        body.get("parent_analysis_id") == record["uid"]):
+                    body = self._deleted_job_body(body)
+                    cancelled = self._deleted_job(job.get("analysis_id") or (job.get("result") or {}).get("analysis_id"), body)
+                    self.conn.execute("UPDATE jobs SET body=?,job=? WHERE request_id=?", (encode(body), encode(cancelled), row["request_id"]))
         if not old or record["version"] >= old["version"]:
             self.conn.execute("INSERT OR REPLACE INTO mirror VALUES (?,?,?)",
                               (record["entity_type"], record["uid"], encode(record)))
@@ -317,7 +337,32 @@ class LocalDatabase:
 
     def update_job(self, request_id, job):
         with self.lock, self.conn:
-            self.conn.execute("UPDATE jobs SET job=? WHERE request_id=?", (encode(job), request_id))
+            row = self.conn.execute("SELECT body,job FROM jobs WHERE request_id=?", (request_id,)).fetchone()
+            if not row:
+                return job
+            previous = json.loads(row["job"])
+            previously_deleted = (previous.get("error") or {}).get("code") == "analysis_deleted"
+            uid = previous.get("analysis_id") if previously_deleted else (job.get("analysis_id") or previous.get("analysis_id"))
+            analysis = self._remote("analyses", uid) if uid else None
+            body = json.loads(row["body"])
+            parent = self._remote("analyses", body["parent_analysis_id"]) if body.get("parent_analysis_id") else None
+            if previously_deleted or (analysis and analysis.get("deleted_at")) or (parent and parent.get("deleted_at")):
+                body = self._deleted_job_body(body)
+                job = self._deleted_job(uid or job.get("analysis_id"), body)
+            self.conn.execute("UPDATE jobs SET body=?,job=? WHERE request_id=?", (encode(body), encode(job), request_id))
+            return job
+
+    @staticmethod
+    def _deleted_job_body(body):
+        # Keep the existing SHA256 fingerprint and IDs as a terminal replay ledger,
+        # but remove copies of selected replies and private preference overrides.
+        return {key: body[key] for key in ("request_id", "conversation_uid", "context_revision", "kind", "parent_analysis_id") if key in body}
+
+    @staticmethod
+    def _deleted_job(analysis_id, body):
+        return dict(analysis_id=analysis_id, status="cancelled", result=None,
+                    conversation_uid=body["conversation_uid"], context_revision=body["context_revision"],
+                    error=dict(code="analysis_deleted"))
 
     def latest_job(self, conversation_uid, revision, kind):
         with self.lock:

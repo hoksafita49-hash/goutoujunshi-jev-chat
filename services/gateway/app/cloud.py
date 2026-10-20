@@ -109,6 +109,21 @@ def cloud_router():
     async def get(analysis_id: UUID, request: Request):
         return await request.app.state.pb.call("job-get", {"id": str(analysis_id)}, request.headers)
 
+    @router.get("/v1/analyses/{analysis_id}/evidence")
+    async def evidence(analysis_id: str, request: Request):
+        import re
+        if not re.fullmatch(UID_PATTERN, analysis_id):
+            raise PBError(422, "invalid_request")
+        return await request.app.state.pb.call("job-evidence", {"id": analysis_id}, request.headers)
+
+    @router.get("/v1/memories/{memory_id}/history")
+    async def memory_history(memory_id: str, request: Request, before_version: int = 0, limit: int = 50):
+        import re
+        if not re.fullmatch(UID_PATTERN, memory_id) or before_version < 0 or not 1 <= limit <= 50:
+            raise PBError(422, "invalid_request")
+        return await request.app.state.pb.call("memory-history", {"id": memory_id,
+            "before_version": before_version, "limit": limit}, request.headers)
+
     return router
 
 

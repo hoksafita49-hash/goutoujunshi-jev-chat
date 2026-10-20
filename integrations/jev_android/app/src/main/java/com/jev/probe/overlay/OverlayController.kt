@@ -566,7 +566,8 @@ class OverlayController(private val ctx: Context) {
                 (if (it.side == "me") "我" else "对方") + "：「" + it.text.take(80) + "」"
             }
             val facts = a.facts.takeIf { it.isNotEmpty() }?.joinToString("\n") ?: quoted
-            if (facts.isNotBlank()) views.add(hint("已核对原文\n$facts"))
+            if (facts.isNotBlank()) views.add(hint(if (a.analysisId != null)
+                "分析事实说法（出处请到云账号页查看原文证据）\n$facts" else "已核对原文\n$facts"))
             if (a.hypotheses.isNotEmpty()) views.add(hint("待确认推测 · " + a.hypotheses.joinToString("；")))
             views.add(hint("仍未知 · " + (a.unknowns.joinToString("；").ifBlank {
                 "仅凭屏幕片段无法确认对方内心、完整上下文和线下情况。" })))

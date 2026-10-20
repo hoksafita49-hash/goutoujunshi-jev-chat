@@ -101,15 +101,18 @@ class CloudAnalysis(private val context: Context,
         parent: String? = null, selected: String? = null): JSONObject {
         val db = ContactRepository(context, session).db
         val client = GatewayClient(session.baseUrl, session)
-        val preferences = db.record("preferences", CloudProtocol.PREFERENCES_UID)?.optJSONObject("payload")
-        val key = "$conversation|$revision|$kind|${parent.orEmpty()}|${selected.orEmpty()}|${preferences?.toString().orEmpty()}"
+        val storedPreferences = db.record("preferences", CloudProtocol.PREFERENCES_UID)?.optJSONObject("payload")
+        // Keep the v1 lookup key so an upgrade never replaces a persisted request ID/body.
+        val key = "$conversation|$revision|$kind|${parent.orEmpty()}|${selected.orEmpty()}|${storedPreferences?.toString().orEmpty()}"
+        val preferences = EvidenceMemoryPreferences.request(storedPreferences ?: JSONObject())
         binding.assertCurrent()
         val existing = db.job(key)
+        check(existing?.optBoolean("local_cancelled") != true) { "原分析或来源已删除，此任务已取消；请核对新的对话上下文" }
         existing?.optJSONObject("result")?.let { return it }
         val body = existing?.getJSONObject("body") ?: JSONObject().put("request_id", UUID.randomUUID().toString())
             .put("conversation_uid", conversation).put("context_revision", revision).put("kind", kind).apply {
                 parent?.let { put("parent_analysis_id", it) }; selected?.let { put("selected_text", it) }
-                preferences?.let { put("preferences", it) }
+                put("preferences", preferences)
             }
         // Persist before the POST. A later explicit user retry reuses these exact bytes and request_id.
         var id = existing?.optString("analysis_id")?.takeIf { it.isNotBlank() && it != "null" }

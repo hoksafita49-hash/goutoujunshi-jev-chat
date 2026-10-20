@@ -80,13 +80,40 @@ class GatewayClient:
         return self.session
 
 
+def evidence_for_ui(snapshot):
+    """Use exact quotes from the immutable analysis snapshot, never current message text."""
+    claims = snapshot.get("evidence")
+    if claims is None:
+        claims = [dict(claim_id=f"legacy-{kind}-{i}", kind=kind, text=text, citation_status="unavailable")
+                  for key, kind in (("facts", "fact"), ("hypotheses", "hypothesis"), ("unknowns", "unknown"))
+                  for i, text in enumerate(snapshot.get(key, []))]
+    messages = {row["uid"]: row for row in snapshot.get("messages", []) if isinstance(row, dict) and row.get("uid")}
+    rows = []
+    for claim in claims if isinstance(claims, list) else []:
+        if not isinstance(claim, dict) or claim.get("kind") not in ("fact", "hypothesis", "unknown") or not isinstance(claim.get("text"), str):
+            continue
+        quotes = []
+        if claim.get("citation_status") == "verified":
+            for ref in claim.get("source_quotes", []):
+                if not isinstance(ref, dict):
+                    continue
+                message, quote = messages.get(ref.get("message_uid")), ref.get("quote")
+                if (message and isinstance(quote, str) and quote and quote in message.get("text", "") and
+                        ref["message_uid"] in claim.get("source_message_uids", [])):
+                    quotes.append(dict(message_uid=message["uid"], quote=quote, role=message.get("role", "unknown"),
+                                       observed_at=message.get("observed_at", ""), version=message.get("version")))
+        rows.append({**claim, "source_quotes": quotes, "source_message_uids": list(dict.fromkeys(q["message_uid"] for q in quotes)),
+                     "citation_status": "verified" if quotes else "unavailable"})
+    return rows
+
+
 def result_for_ui(result):
     rows = result.get("candidates") or []
     weights = [row.get("weight") if result.get("ranking_status") == "available" else None for row in rows]
     return {"candidates": [r["text"] for r in rows], "candidate_ids": [r["candidate_id"] for r in rows],
             "scores": weights, "best_index": 0 if rows else None, "server_order": True,
             "analysis_id": result["analysis_id"], "conversation_uid": result["conversation_uid"],
-            "context_revision": result["context_revision"], "cloud_result": result,
+            "context_revision": result["context_revision"], "cloud_result": result, "evidence": evidence_for_ui(result),
             "goutou": {"facts": result.get("facts", []), "action": result.get("strategy", ""),
                        "intent": "；".join(result.get("hypotheses", [])) or "仍未知",
                        "unknown": "；".join(result.get("unknowns", [])),

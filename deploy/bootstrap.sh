@@ -219,11 +219,11 @@ fi
 python3 - "$release" <<'PY'
 import datetime, json, pathlib, sys
 manifest = {
-    "stage": "private-cloud-v1", "pocketbase": "0.40.5",
+    "stage": "private-cloud-v2", "pocketbase": "0.40.5",
     "gateway_release": sys.argv[1],
     "deployed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "public_access": False, "domain": "api.zovoeh.cn",
-    "sync_implemented": True
+    "sync_implemented": True, "evidence_implemented": True, "memory_history_implemented": True
 }
 pathlib.Path("/opt/goutou/deployment.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY

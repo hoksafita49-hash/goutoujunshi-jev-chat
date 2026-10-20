@@ -98,6 +98,8 @@ class CloudAccountActivity : AppCompatActivity() {
         button("查看与处理冲突") { showConflicts(db) }
         button("被拒草稿 · 查看错误与手动重新排队") { showRejected(db, session) }
         button("跨端回复偏好") {
+            val binding = try { CloudAccountBinding.capture(AndroidCloudSessionAccess(this)) }
+                catch (e: Exception) { Toast.makeText(this, e.message ?: "请先启用云模式并登录", Toast.LENGTH_LONG).show(); return@button }
             val preferences = db.record("preferences", CloudProtocol.PREFERENCES_UID)?.optJSONObject("payload") ?: JSONObject()
             val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 12, 24, 12) }
             fun input(label: String, value: String): EditText {
@@ -106,15 +108,21 @@ class CloudAccountActivity : AppCompatActivity() {
             }
             val tone = input("口吻", preferences.optString("tone", "自然"))
             val length = input("回复长度", preferences.optString("length", "适中"))
-            val count = input("候选数量（1–5）", preferences.optInt("count", 3).toString())
+            val count = input("候选数量（1–3）", preferences.optInt("count", 3).toString())
             val style = input("个人表达习惯", preferences.optString("style"))
             AlertDialog.Builder(this).setTitle("同一账号共享偏好").setView(box).setNegativeButton("取消", null)
                 .setPositiveButton("保存并同步") { _, _ ->
-                    val payload = JSONObject().put("tone", tone.text.toString()).put("length", length.text.toString())
-                        .put("count", count.text.toString().toIntOrNull()?.coerceIn(1, 5) ?: 3).put("style", style.text.toString())
+                    val toneValue = tone.text.toString(); val lengthValue = length.text.toString()
+                    val countValue = count.text.toString().toIntOrNull() ?: 3; val styleValue = style.text.toString()
                     runWork {
-                        check(CloudRuntime.current(this, session)) { "账号已切换" }
-                        db.edit("preferences", CloudProtocol.PREFERENCES_UID, payload); CloudRuntime.schedule(this); "偏好已保存到待上传队列"
+                        binding.withCurrent {
+                            check(it.accountKey == session.accountKey && it.deviceId == session.deviceId) { "账号已切换" }
+                            db.transaction { sql ->
+                                val latest = db.record("preferences", CloudProtocol.PREFERENCES_UID)?.optJSONObject("payload") ?: JSONObject()
+                                db.edit(sql, "preferences", CloudProtocol.PREFERENCES_UID, EvidenceMemoryPreferences.save(latest, toneValue, lengthValue, countValue, styleValue))
+                            }
+                        }
+                        CloudRuntime.schedule(this); "偏好已保存到待上传队列"
                     }
                 }.show()
         }
@@ -122,14 +130,19 @@ class CloudAccountActivity : AppCompatActivity() {
             val analyses = db.records("analyses")
             AlertDialog.Builder(this).setTitle("已同步分析 ${analyses.size} 条")
                 .setItems(analyses.map { it.getString("uid") }.toTypedArray()) { _, which ->
-                    showText("云端分析", analyses[which].getJSONObject("payload").toString(2))
+                    CloudEvidenceMemoryActivity.open(this, session, analyses[which].getString("uid"))
                 }.setNegativeButton("关闭", null).show()
         }
+        button("人物记忆 · 核对、修改与历史") { CloudEvidenceMemoryActivity.open(this, session) }
         button("任务记录与手动重新请求") {
             val jobs = db.jobs()
             AlertDialog.Builder(this).setTitle("再次分析默认继续原任务")
-                .setItems(jobs.map { "${it.getJSONObject("body").optString("kind")} · ${it.optString("analysis_id")} ${if (it.getBoolean("completed")) "已完成" else "结果待查询"}" }.toTypedArray()) { _, n ->
+                .setItems(jobs.map { "${it.getJSONObject("body").optString("kind")} · ${it.optString("analysis_id")} ${if (it.optBoolean("local_cancelled")) "原文已删除 · 已取消" else if (it.getBoolean("completed")) "已完成" else "结果待查询"}" }.toTypedArray()) { _, n ->
                     val job = jobs[n]
+                    if (job.optBoolean("local_cancelled")) {
+                        showText("原分析或来源已删除", "已清除正文，只保留请求编号等取消记录用于阻止重复提交。此任务不能恢复或重新请求；请核对新的对话上下文。")
+                        return@setItems
+                    }
                     AlertDialog.Builder(this).setTitle("明确允许新的付费请求")
                         .setMessage("原请求编号与结果会保留在恢复导出中。若上游已接受但响应丢失，新请求可能再次计费。取消后，下次分析仍继续查询原任务。")
                         .setNegativeButton("保留原任务", null).setPositiveButton("允许新请求") { _, _ -> runWork {

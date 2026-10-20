@@ -13,6 +13,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.UUID
+import java.net.ServerSocket
+import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30], application = android.app.Application::class)
@@ -117,5 +121,98 @@ class LocalDatabaseTest {
         assertEquals("1970-01-01T00:00:01Z", db.records("messages")[0].getJSONObject("payload").getString("observed_at"))
         assertEquals(before, source.readText())
         assertTrue(db.records("notes")[0].getJSONObject("payload").getBoolean("always_on"))
+    }
+
+    @Test fun analysisDeletionScrubsJobResultsAndArchivedRecoveryCopies() {
+        val db = database(); val secret = "删除后不可恢复的分析私密正文"; val selected = "删除后不可恢复的候选正文"
+        val activeKey = "active|$selected"; val archivedKey = "archived|$selected"
+        val result = JSONObject().put("analysis_id", "a").put("text", secret)
+        val live = record(uid = "a").put("entity_type", "analyses").put("payload", JSONObject().put("result", result))
+        db.applyPage(page(live))
+        val activeBody = JSONObject().put("request_id", "active-request").put("conversation_uid", "c").put("kind", "rewrite").put("selected_text", selected)
+        val archivedBody = JSONObject().put("request_id", "archived-request").put("conversation_uid", "c").put("kind", "rewrite").put("selected_text", selected)
+        db.saveJob(activeKey, activeBody, "a", result)
+        db.saveJob(archivedKey, archivedBody, "a", result)
+        db.allowNewJob(archivedKey)
+        val nextRequest = db.job(archivedKey)!!.getJSONObject("body").getString("request_id")
+        db.saveJob("unrelated", JSONObject().put("request_id", "unrelated-request"), "other", JSONObject().put("text", "另一条结果"))
+
+        db.applyPage(page(record(uid = "a", version = 2, deleted = true).put("entity_type", "analyses").put("payload", JSONObject()), "deleted"))
+
+        val active = db.job(activeKey)!!
+        assertTrue(active.isNull("result")); assertEquals("a", active.getString("analysis_id"))
+        assertTrue(active.getBoolean("local_cancelled")); assertFalse(active.getJSONObject("body").has("selected_text"))
+        assertEquals("active-request", active.getJSONObject("body").getString("request_id"))
+        assertEquals(nextRequest, db.job(archivedKey)!!.getJSONObject("body").getString("request_id"))
+        assertTrue(db.job(archivedKey)!!.getBoolean("local_cancelled"))
+        assertThrows(IllegalStateException::class.java) { db.allowNewJob(activeKey) }
+        assertThrows(IllegalStateException::class.java) { db.allowNewJob(archivedKey) }
+        assertEquals("另一条结果", db.job("unrelated")!!.getJSONObject("result").getString("text"))
+        assertEquals(3, db.jobs().size)
+        val exported = db.exportRecovery(File(context.cacheDir, UUID.randomUUID().toString())).readText()
+        assertFalse("Deleted analysis text must not survive in recovery JSON", exported.contains(secret))
+        assertFalse("Deleted selected_text must not survive in keys, bodies or archived copies", exported.contains(selected))
+        val metadata = JSONObject(exported).getJSONArray("meta")
+        val archived = (0 until metadata.length()).map { metadata.getJSONObject(it) }
+            .single { it.getString("k").startsWith("previous_job/") }.getString("v").let(::JSONObject)
+        assertTrue(archived.isNull("result")); assertEquals("a", archived.getString("analysis_id"))
+        assertTrue(archived.getBoolean("local_cancelled")); assertFalse(archived.getJSONObject("body").has("selected_text"))
+        assertEquals("archived-request", archived.getJSONObject("body").getString("request_id"))
+    }
+
+    @Test fun lateJobResultAndOldPullCannotReviveDeletedAnalysis() {
+        val db = database(); val body = JSONObject().put("request_id", "keep-this-request")
+        val result = JSONObject().put("analysis_id", "a").put("text", "晚到的已删除私密正文")
+        db.saveJob("active", body, "a")
+        db.applyPage(page(record(uid = "a", version = 2, deleted = true).put("entity_type", "analyses").put("payload", JSONObject()), "deleted"))
+        assertThrows(IllegalStateException::class.java) { db.saveJob("active", body, "a", result) }
+        assertThrows(IllegalStateException::class.java) { db.saveJob("active", JSONObject().put("request_id", "must-not-replace-original").put("selected_text", "晚到的已删除私密正文"), "a", result) }
+        assertThrows(IllegalStateException::class.java) { db.saveJob("new-key", JSONObject().put("request_id", "late-new-request").put("selected_text", "晚到的已删除私密正文"), "a", result) }
+        db.applyPage(page(record(uid = "a", version = 1).put("entity_type", "analyses").put("payload", JSONObject().put("result", result)), "old-page"))
+        assertEquals(2, db.record("analyses", "a")!!.getInt("version"))
+        assertFalse(db.record("analyses", "a")!!.isNull("deleted_at"))
+        assertTrue(db.job("active")!!.isNull("result")); assertEquals("a", db.job("active")!!.getString("analysis_id"))
+        assertEquals("keep-this-request", db.job("active")!!.getJSONObject("body").getString("request_id"))
+        assertEquals(2, db.jobs().size)
+        assertTrue(db.job("new-key")!!.getBoolean("local_cancelled"))
+        assertFalse(db.exportRecovery(File(context.cacheDir, UUID.randomUUID().toString())).readText().contains("晚到的已删除私密正文"))
+    }
+
+    @Test fun reopeningLegacyTombstoneScrubsPreviouslyCachedPrivateJobs() {
+        val db = database(); val secret = "升级前残留的已删除结果和候选正文"
+        db.applyPage(page(record(uid = "a", version = 2, deleted = true).put("entity_type", "analyses").put("payload", JSONObject())))
+        val body = JSONObject().put("request_id", "legacy-request").put("conversation_uid", "c").put("selected_text", secret)
+        val result = JSONObject().put("analysis_id", "a").put("text", secret)
+        db.transaction { sql -> sql.execSQL("INSERT INTO jobs(k,body,analysis_id,result) VALUES(?,?,?,?)", arrayOf("legacy|$secret", body.toString(), "a", result.toString())) }
+        db.setMeta("previous_job/legacy", JSONObject().put("body", body).put("analysis_id", "a").put("result", result).toString())
+        db.close()
+        val reopened = db.job("legacy|$secret")!!
+        assertTrue(reopened.getBoolean("local_cancelled")); assertTrue(reopened.isNull("result"))
+        assertEquals("legacy-request", reopened.getJSONObject("body").getString("request_id"))
+        assertFalse(db.exportRecovery(File(context.cacheDir, UUID.randomUUID().toString())).readText().contains(secret))
+    }
+
+    @Test fun cancelledJobCannotReturnTextOrCreateAnotherPaidRequest() {
+        val session = CloudSession("http://127.0.0.1:18000", "t", UUID.randomUUID().toString(), "e", "d", "s", "epoch")
+        val db = LocalDatabase.get(context, session.accountKey)
+        db.applyPage(page(record(uid = "c").put("entity_type", "conversations").put("payload", JSONObject().put("context_revision", 2))))
+        val key = "c|2|explain|parent||"
+        val body = JSONObject().put("request_id", "cancelled-request").put("conversation_uid", "c").put("context_revision", 2).put("kind", "explain").put("parent_analysis_id", "parent")
+        db.saveJob(key, body, "a", JSONObject().put("text", "已删除任务结果"))
+        db.applyPage(page(record(uid = "a", version = 2, deleted = true).put("entity_type", "analyses").put("payload", JSONObject())))
+        val analysis = CloudProtocol.analysis(JSONObject("""{"schema_version":1,"analysis_id":"parent","conversation_uid":"c","context_revision":2,"candidates":[],"ranking_status":"unavailable"}"""))
+            .copy(cloudAccount = session.accountKey, cloudDeviceId = session.deviceId)
+        val server = ServerSocket(18000, 5, InetAddress.getByName("127.0.0.1")); val unexpected = AtomicReference<String?>()
+        val serving = thread(isDaemon = true) { try { server.accept().use { socket ->
+            unexpected.set(socket.getInputStream().bufferedReader().readLine())
+            val response = "{\"error\":{\"code\":\"unexpected_request\"}}"
+            socket.getOutputStream().write(("HTTP/1.1 400 Test\r\nContent-Length: ${response.length}\r\nConnection: close\r\n\r\n$response").toByteArray())
+        } } catch (_: Exception) { } }
+        try {
+            assertThrows(IllegalStateException::class.java) { CloudAnalysis(context, object : CloudSessionAccess { override fun current() = session }).followup(analysis, "explain") }
+            assertThrows(IllegalStateException::class.java) { db.allowNewJob(key) }
+            assertNull(unexpected.get()); assertEquals("cancelled-request", db.job(key)!!.getJSONObject("body").getString("request_id"))
+            assertEquals(1, db.jobs().size)
+        } finally { server.close(); serving.join(1000) }
     }
 }

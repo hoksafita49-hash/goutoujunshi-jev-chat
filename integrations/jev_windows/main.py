@@ -222,7 +222,7 @@ def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=No
             from app.cloud_runtime import current
             service = current()
             identity = account_identity or service.identity
-            result = service.analyze(captured_app or state["app"], title, msgs, {"style": settings.style()},
+            result = service.analyze(captured_app or state["app"], title, msgs, None,
                                      expected_identity=identity, source_messages=source_messages, expected_context=expected_context)
             result["cloud_identity"] = identity
             result["reviewed_messages"] = msgs

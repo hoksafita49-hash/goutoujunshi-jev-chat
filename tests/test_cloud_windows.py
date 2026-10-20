@@ -243,6 +243,19 @@ class CloudWindowsTests(unittest.TestCase):
         main.settings.strategy_key.assert_not_called()
         self.assertEqual(main.results.get()[1]["cloud_identity"], "account-generation")
 
+    def test_cloud_analysis_reads_account_preferences_after_sync_instead_of_sending_stale_style(self):
+        from unittest.mock import patch
+        from test_windows_capture_flow import load_main
+        main = load_main()
+        main.settings.cloud_mode.return_value = True
+        main.settings.style.return_value = "同步前的旧风格"
+        service = Mock(identity="account-generation")
+        service.analyze.return_value = dict(candidates=[], analysis_id="a")
+        with patch.dict("sys.modules", {"app.cloud_runtime": Mock(current=Mock(return_value=service))}):
+            main.analyze_bg([("her", "你好")], "会话", 0, epoch=0)
+        self.assertIsNone(service.analyze.call_args.args[3], "Repository must select the complete account preferences after sync")
+        main.settings.style.assert_not_called()
+
     def test_backfill_order_key_places_older_capture_before_existing_rows(self):
         db = self.db()
         db.confirm_messages("c", "p", [("her", "中"), ("me", "晚")])
@@ -294,6 +307,8 @@ class CloudWindowsTests(unittest.TestCase):
         db = self.db()
         service = Mock()
         service.require.return_value.db = db
+        preference_uid = "00000000-0000-4000-8000-000000000001"
+        db.save("preferences", preference_uid, dict(tone="calm", length="long", count=1, style="", future={"keep": True}))
         config = self.root / "config.json"
         config.write_text(json.dumps(dict(connection_mode="cloud", cloud_server="https://api.example.test", style="原直连偏好")), encoding="utf-8")
         spec = importlib.util.spec_from_loader("integrations.jev_windows.app.settings", loader=None)
@@ -303,6 +318,11 @@ class CloudWindowsTests(unittest.TestCase):
             self.assertEqual(settings.style(), "")
             settings.save(style_text="云账号风格")
             self.assertEqual(settings.style(), "云账号风格")
+            self.assertEqual(db.visible("preferences", preference_uid)["payload"],
+                             dict(tone="calm", length="long", count=1, style="云账号风格", future={"keep": True}))
+            settings.save(style_text="")
+            self.assertEqual(db.visible("preferences", preference_uid)["payload"],
+                             dict(tone="calm", length="long", count=1, style="", future={"keep": True}))
             settings.save(debug_view_on=False)
         stored = json.loads(config.read_text(encoding="utf-8"))
         self.assertEqual(stored["cloud_server"], "https://api.example.test")
@@ -418,6 +438,134 @@ class CloudWindowsTests(unittest.TestCase):
         sent = gateway.request.call_args.args[2]
         self.assertEqual(sent["request_id"], original["request_id"])
         self.assertEqual(sent["preferences"], {"style": "原始偏好"})
+
+    def test_analysis_tombstone_scrubs_job_results_and_recovery_copy_preserving_request_identity(self):
+        import sqlite3
+        from contextlib import closing
+        db = self.db()
+        db.check_epoch("before")
+        pending = db.prepare_job("c", 2, "rewrite", parent="parent", selected_text="PRIVATE-SELECTED-DELETE",
+                                 preferences={"style": "PRIVATE-STYLE-DELETE"})
+        fingerprint = db.conn.execute("SELECT fingerprint FROM jobs").fetchone()[0]
+        result = dict(analysis_id="a", conversation_uid="c", context_revision=2, candidates=[], facts=["PRIVATE-JOB-RESULT-DELETE"])
+        db.update_job(pending["request_id"], dict(analysis_id="a", status="succeeded", conversation_uid="c", context_revision=2, result=result))
+        db.apply_pull([dict(seq=1, record=record("analyses", "a", result))], "live")
+        db.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "gone")
+        saved = db.latest_job("c", 2, "rewrite")
+        self.assertEqual(saved["job"].get("status"), "cancelled")
+        self.assertIsNone(saved["job"].get("result"))
+        self.assertEqual(saved["body"], dict(request_id=pending["request_id"], conversation_uid="c", context_revision=2,
+                                            kind="rewrite", parent_analysis_id="parent"))
+        self.assertEqual(db.conn.execute("SELECT fingerprint FROM jobs").fetchone()[0], fingerprint)
+        self.assertEqual(db.prepare_job("c", 2, "rewrite", parent="parent", selected_text="PRIVATE-SELECTED-DELETE",
+                                       preferences={"style": "PRIVATE-STYLE-DELETE"})["request_id"], pending["request_id"])
+        with self.assertRaisesRegex(RuntimeError, "server_epoch_changed"):
+            db.check_epoch("after")
+        recovery = next(self.root.glob("*.recovery-*.sqlite3"))
+        with closing(sqlite3.connect(recovery)) as copy:
+            dump = "\n".join(copy.iterdump())
+            for private in ("PRIVATE-JOB-RESULT-DELETE", "PRIVATE-SELECTED-DELETE", "PRIVATE-STYLE-DELETE"):
+                self.assertNotIn(private, dump)
+
+    def test_parent_analysis_tombstone_cancels_unsent_child_and_scrubs_its_private_request(self):
+        db = self.db()
+        pending = db.prepare_job("c", 2, "rewrite", parent="a", selected_text="PRIVATE-UNSENT-CHILD",
+                                 preferences={"style": "PRIVATE-CHILD-STYLE"})
+        db.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "gone")
+        saved = db.latest_job("c", 2, "rewrite")
+        self.assertEqual(saved["job"].get("status"), "cancelled")
+        self.assertEqual(saved["request_id"], pending["request_id"])
+        self.assertNotIn("selected_text", saved["body"])
+        self.assertNotIn("preferences", saved["body"])
+        gateway = Mock()
+        with self.assertRaisesRegex(RuntimeError, "analysis_deleted"):
+            module("repositories").CloudRepository(db, gateway).run_job("c", 2, "rewrite")
+        gateway.request.assert_not_called()
+        db.update_job(pending["request_id"], dict(analysis_id="child", conversation_uid="c", context_revision=2,
+                                                status="succeeded", result={"text": "PRIVATE-LATE-CHILD"}))
+        self.assertNotIn("PRIVATE-", db.conn.execute("SELECT body || job FROM jobs").fetchone()[0])
+
+    def test_reopen_scrubs_legacy_job_copy_when_analysis_tombstone_was_already_consumed(self):
+        db = self.db()
+        pending = db.prepare_job("c", 2, "analysis", preferences={"style": "PRIVATE-LEGACY-PREFERENCE"})
+        legacy_job = dict(analysis_id="a", conversation_uid="c", context_revision=2, status="succeeded",
+                          result=dict(analysis_id="a", facts=["PRIVATE-LEGACY-JOB-COPY"]))
+        db.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "already-consumed")
+        # A v1 cache persisted its task copy before this deletion cleanup existed.
+        with db.conn:
+            db.conn.execute("UPDATE jobs SET job=? WHERE request_id=?", (json.dumps(legacy_job), pending["request_id"]))
+        reopened = self.db()
+        self.assertEqual(reopened.cursor, "already-consumed")
+        saved = reopened.latest_job("c", 2, "analysis")
+        self.assertEqual(saved["job"]["status"], "cancelled")
+        self.assertIsNone(saved["job"].get("result"))
+        self.assertNotIn("preferences", saved["body"])
+        self.assertNotIn("PRIVATE-", reopened.conn.execute("SELECT body || job FROM jobs").fetchone()[0])
+
+    def test_deleted_analysis_cache_cannot_resurrect_from_late_response_or_historical_pull(self):
+        for first_receipt_is_late in (False, True):
+            with self.subTest(first_receipt_is_late=first_receipt_is_late):
+                db = self.db("late-" + str(first_receipt_is_late))
+                pending = db.prepare_job("c", 2, "analysis")
+                result = dict(analysis_id="a", conversation_uid="c", context_revision=2, candidates=[], facts=["PRIVATE-LATE-RESULT"])
+                response = dict(analysis_id="a", status="succeeded", conversation_uid="c", context_revision=2, result=result)
+                if not first_receipt_is_late:
+                    db.update_job(pending["request_id"], response)
+                db.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "gone")
+                db.update_job(pending["request_id"], response)
+                db.apply_pull([dict(seq=1, record=record("analyses", "a", result))], "historical")
+                saved = db.latest_job("c", 2, "analysis")
+                self.assertEqual(saved["job"].get("status"), "cancelled")
+                self.assertIsNone(saved["job"].get("result"))
+                self.assertTrue(db.visible("analyses", "a")["deleted_at"])
+                self.assertNotIn("PRIVATE-LATE-RESULT", db.conn.execute("SELECT job FROM jobs").fetchone()[0])
+
+    def test_deleted_job_resume_stops_without_network_and_late_poll_cannot_return_its_result(self):
+        db = self.db()
+        pending = db.prepare_job("c", 2, "analysis")
+        result = dict(analysis_id="a", conversation_uid="c", context_revision=2, candidates=[], facts=["PRIVATE-POLL-RESULT"])
+        response = dict(analysis_id="a", status="succeeded", conversation_uid="c", context_revision=2, result=result)
+        db.update_job(pending["request_id"], response)
+        db.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "gone")
+        gateway = Mock()
+        gateway.request.return_value = response
+        with self.assertRaisesRegex(RuntimeError, "analysis_deleted"):
+            module("repositories").CloudRepository(db, gateway).run_job("c", 2)
+        gateway.request.assert_not_called()
+        other = self.db("while-polling")
+        gateway = Mock()
+        def respond(method, path, *_args):
+            if method == "POST":
+                return dict(analysis_id="a", status="queued")
+            other.apply_pull([dict(seq=2, record=record("analyses", "a", {}, 2, "deleted"))], "gone")
+            return response
+        gateway.request.side_effect = respond
+        with self.assertRaisesRegex(RuntimeError, "analysis_deleted"):
+            module("repositories").CloudRepository(other, gateway).run_job("c", 2)
+        self.assertEqual(other.latest_job("c", 2, "analysis")["job"]["status"], "cancelled")
+
+    def test_partial_analysis_preferences_preserve_saved_fields_and_unknown_values(self):
+        db = self.db()
+        saved = dict(tone="warm", length="long", count=1, style="原风格", future={"enabled": True})
+        db.save("preferences", "00000000-0000-4000-8000-000000000001", saved)
+        gateway = Mock()
+        gateway.request.side_effect = RuntimeError("network_ambiguous")
+        with self.assertRaisesRegex(RuntimeError, "network_ambiguous"):
+            module("repositories").CloudRepository(db, gateway).run_job("c", 2, preferences={"style": ""})
+        sent = gateway.request.call_args.args[2]["preferences"]
+        self.assertEqual(sent, dict(tone="warm", length="long", count=1, style="", future={"enabled": True}))
+        self.assertEqual(db.visible("preferences", "00000000-0000-4000-8000-000000000001")["payload"], saved)
+
+    def test_new_browser_analysis_sends_saved_preferences_without_replacing_a_resumed_job(self):
+        db = self.db()
+        db.save("preferences", "00000000-0000-4000-8000-000000000001",
+                dict(tone="calm", length="medium", count=2, style="简洁", future="retained"))
+        gateway = Mock()
+        gateway.request.side_effect = RuntimeError("network_ambiguous")
+        with self.assertRaises(RuntimeError):
+            module("repositories").CloudRepository(db, gateway).run_job("c", 2, new_request=True)
+        self.assertEqual(gateway.request.call_args.args[2].get("preferences"),
+                         dict(tone="calm", length="medium", count=2, style="简洁", future="retained"))
 
     def test_rebinding_person_after_review_cannot_move_confirmed_text_to_new_person(self):
         runtime, auth = module("cloud_runtime"), module("auth_store")

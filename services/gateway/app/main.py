@@ -228,7 +228,7 @@ def create_app(settings: Settings | None = None, *, transport=None, start_worker
             "server_epoch": account.get("server_epoch") if account else None,
             "sync": {"push_limit": 50, "pull_limit": 200},
             "model_ready": any(route.api_key for route in settings.routes.values()),
-            "supported": ["accounts", "sync", "analyses", "explanations", "rewrites"] if settings.pb_internal_key else ["text_chat_completions"],
+            "supported": ["accounts", "sync", "analyses", "explanations", "rewrites", "evidence", "memory_history"] if settings.pb_internal_key else ["text_chat_completions"],
         }
 
     @app.get("/v1/models")

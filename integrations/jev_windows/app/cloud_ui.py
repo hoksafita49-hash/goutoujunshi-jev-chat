@@ -21,6 +21,8 @@ class CloudPanel(QWidget):
         super().__init__()
         self.overlay, self.busy, self.failures, self.next_sync = overlay, False, 0, 0
         self.account_dialogs = []
+        self._account_key = None
+        self._run_context = None
         self._completion = None
         self._failure = None
         self.signals = _Signals(self)
@@ -71,6 +73,9 @@ class CloudPanel(QWidget):
         edit_profile = QPushButton("编辑所选人物资料")
         edit_profile.clicked.connect(self.edit_profile)
         layout.addWidget(edit_profile)
+        self.memory_button = QPushButton("长期记忆 · 新增、更正、确认与历史")
+        self.memory_button.clicked.connect(self.memories)
+        layout.addWidget(self.memory_button)
         self.recovery = QPushButton("服务器恢复后：保留本地副本并重新拉取")
         self.recovery.clicked.connect(self.recover)
         self.recovery.hide()
@@ -96,6 +101,7 @@ class CloudPanel(QWidget):
             return
         try:
             server = validate_server(self.server.text())
+            self._close_account_dialogs()
             settings.save(cloud_mode_on=self.mode.currentIndex() == 1, cloud_server_text=server)
             self.overlay.invalidate_replies()
             self.overlay.reset_chat_state()
@@ -110,7 +116,10 @@ class CloudPanel(QWidget):
         if self.busy:
             return
         self.busy = True
+        service = current()
+        self._run_context = (service, service.identity)
         if account_change:
+            self._close_account_dialogs()
             self.overlay.invalidate_replies()
             self.overlay.reset_chat_state()
             self.overlay.settingsPage.setEnabled(False)
@@ -130,15 +139,18 @@ class CloudPanel(QWidget):
         self.overlay.settingsPage.setEnabled(True)
         self.failures = min(6, self.failures + 1) if error else 0
         self.next_sync = time.monotonic() + (15 * 2 ** self.failures)
-        if account_change or (settings.cloud_mode() and not current().session):
-            for dialog in self.account_dialogs:
-                dialog.reject()
-            self.account_dialogs.clear()
+        stable = bool(self._run_context and settings.cloud_mode() and current() is self._run_context[0] and
+                      current().identity == self._run_context[1])
+        if account_change or not stable or (settings.cloud_mode() and not current().session):
+            self._close_account_dialogs()
             self.overlay.reset_chat_state()
             self.overlay.invalidate_replies()
             if self.overlay.on_settings_saved:
                 self.overlay.on_settings_saved()
         self.refresh()
+        if not account_change and not stable:
+            self._completion = self._failure = self._run_context = None
+            return
         if isinstance(value, dict) and value.get("model_ready") is False:
             self.status.setText(self.status.text() + " · 服务端模型尚未配置，资料同步仍可用")
         if error:
@@ -149,6 +161,12 @@ class CloudPanel(QWidget):
             self._completion(value)
         self._completion = None
         self._failure = None
+        self._run_context = None
+
+    def _close_account_dialogs(self):
+        for dialog in list(self.account_dialogs):
+            dialog.reject()
+        self.account_dialogs.clear()
 
     def login(self):
         if not settings.cloud_mode():
@@ -176,6 +194,11 @@ class CloudPanel(QWidget):
             self.sync()
 
     def refresh(self):
+        service = current() if settings.cloud_mode() else None
+        account_key = (service, service.identity) if service else None
+        if account_key != self._account_key:
+            self._close_account_dialogs()
+            self._account_key = account_key
         self.people.clear()
         self.profiles = []
         self.recovery.hide()
@@ -206,6 +229,24 @@ class CloudPanel(QWidget):
         if index < 0 or index >= len(self.profiles):
             raise ValueError("请先创建或选择云端人物")
         return self.profiles[index]
+
+    def memories(self):
+        try:
+            from .cloud_memory_ui import MemoryDialog
+            MemoryDialog(self, self._selected()["uid"]).open()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def show_evidence(self, result):
+        try:
+            from .cloud_memory_ui import EvidenceDialog
+            service = current()
+            self._repo()
+            if result.get("cloud_identity", service.identity) != service.identity:
+                raise RuntimeError("account_changed")
+            EvidenceDialog(self, result).open()
+        except Exception as exc:
+            self.status.setText(str(exc))
 
     def create_profile(self):
         try:
@@ -385,6 +426,12 @@ class CloudPanel(QWidget):
             layout.addWidget(view)
             candidates = QComboBox()
             layout.addWidget(candidates)
+            evidence_chooser = QComboBox()
+            evidence_chooser.setAccessibleName("选择要核对证据的历史分析")
+            layout.addWidget(evidence_chooser)
+            evidence_button = QPushButton("查看所选分析的证据与原文出处")
+            evidence_button.clicked.connect(lambda: self.show_evidence(evidence_chooser.currentData()) if evidence_chooser.currentData() else None)
+            layout.addWidget(evidence_button)
             def render():
                 p = repo.db.visible("profiles", profile["uid"])
                 if not p or p.get("deleted_at"):
@@ -396,6 +443,7 @@ class CloudPanel(QWidget):
                          "目标：" + payload.get("goal", ""), "背景：" + payload.get("background", ""),
                          "备注：" + payload.get("notes", "")]
                 candidates.clear()
+                evidence_chooser.clear()
                 index = chooser.currentIndex()
                 if index >= 0:
                     uid = conversations[index]["uid"]
@@ -409,6 +457,8 @@ class CloudPanel(QWidget):
                         result = row["payload"].get("result") or row["payload"]
                         if not result.get("analysis_id"):
                             continue
+                        evidence_chooser.addItem(result["analysis_id"][:12] + " · 上下文版本 " + str(result.get("context_revision", "")),
+                            {**result, "profile_uid": profile["uid"], "conversation_uid": uid, "cloud_identity": current().identity})
                         lines.extend(["\n分析 " + result["analysis_id"], "策略：" + result.get("strategy", ""),
                                       "事实：" + "；".join(result.get("facts", [])),
                                       "推测：" + "；".join(result.get("hypotheses", [])),

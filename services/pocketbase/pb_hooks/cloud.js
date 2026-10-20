@@ -11,6 +11,11 @@ const TYPES = [
   "analyses",
 ];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const evidenceMemory = require(__hooks + "/evidence_memory.js");
+function domainHelpers() {
+  return {entity: entity, parsed: parsed, fail: fail, canonical: canonical, first: first,
+    all: all, now: now, emit: emit, tombstone: tombstone, touchConversation: touchConversation};
+}
 function fail(code, status) {
   const error = new Error(code);
   error.cloudCode = code;
@@ -201,6 +206,11 @@ function validatePayload(app, owner, type, data, old) {
   )
     fail("invalid_memory_status");
   if (type === "feedback") live(app, owner, "analyses", data.analysis_uid);
+  if (type === "memories") data = evidenceMemory.memory(app, owner, data, old, domainHelpers());
+  if (type === "preferences") {
+    evidenceMemory.preferences(data, domainHelpers());
+    data = Object.assign({}, old ? parsed(old, "payload") : {}, data);
+  }
   return data;
 }
 function touchConversation(app, owner, id) {
@@ -219,6 +229,7 @@ function tombstone(app, record) {
   const owner = record.getString("owner"),
     type = record.getString("entity_type"),
     id = record.getString("uid");
+  evidenceMemory.deleted(app, record, domainHelpers());
   const children =
     ["profiles", "conversations", "analyses"].indexOf(type) >= 0
       ? all(app, "cloud_entities", "owner={:o} && deleted_at=''", { o: owner })
@@ -232,6 +243,8 @@ function tombstone(app, record) {
     )
       tombstone(app, child);
   }
+  // Cascades may advance this conversation while invalidating confirmed memory.
+  record = app.findRecordById("cloud_entities", record.id);
   const stamp = now();
   record.set("deleted_at", stamp);
   record.set("updated_at", stamp);
@@ -342,9 +355,11 @@ function apply(app, session, operation) {
         if (!record) fail("entity_missing");
         const previous = parsed(record, "payload");
         tombstone(app, record);
+        record = app.findRecordById("cloud_entities", record.id);
         if (operation.entity_type === "messages")
           touchConversation(app, session.owner, previous.conversation_uid);
       } else {
+        const previousPayload = record ? parsed(record, "payload") : null;
         const payload = validatePayload(
           app,
           session.owner,
@@ -366,6 +381,10 @@ function apply(app, session, operation) {
         emit(app, record);
         if (operation.entity_type === "messages")
           touchConversation(app, session.owner, payload.conversation_uid);
+        if (operation.entity_type === "messages" && previousPayload && canonical(previousPayload) !== canonical(payload))
+          evidenceMemory.sourceChanged(app, session.owner, operation.entity_uid, domainHelpers());
+        if (operation.entity_type === "memories")
+          evidenceMemory.memoryChanged(app, session.owner, previousPayload, payload, domainHelpers());
       }
       result.status = "applied";
       result.record = publicRecord(record);
@@ -527,6 +546,7 @@ function createJob(app, session, data) {
     .map((r) => {
       const p = parsed(r, "payload");
       p.uid = r.getString("uid");
+      p.version = r.getInt("version");
       return p;
     })
     .filter(
@@ -546,7 +566,7 @@ function createJob(app, session, data) {
     "owner={:o} && entity_type='memories' && deleted_at=''",
     { o: session.owner },
   )
-    .map((r) => parsed(r, "payload"))
+    .map((r) => Object.assign({}, parsed(r, "payload"), {uid: r.getString("uid")}))
     .filter(
       (p) => p.profile_uid === context.profile_uid && p.status === "confirmed",
     );
@@ -570,7 +590,8 @@ function createJob(app, session, data) {
     messages: messages.slice(-64),
     memories: memories.slice(-30),
     notes: notes.slice(0, 30),
-    preferences: data.preferences || (prefs ? parsed(prefs, "payload") : {}),
+    preferences: Object.assign({}, prefs && !prefs.getString("deleted_at") ? parsed(prefs, "payload") : {},
+      data.preferences === undefined ? {} : evidenceMemory.preferences(data.preferences, domainHelpers())),
     selected_text: data.selected_text || "",
   };
   if (
@@ -590,6 +611,7 @@ function createJob(app, session, data) {
     )
       fail("parent_analysis_unavailable");
     input.parent_result = parsed(parent, "result");
+    input.parent_analysis_id = parent.getString("uid");
   }
   const job = new Record(app.findCollectionByNameOrId("cloud_jobs"));
   job.set("owner", session.owner);
@@ -856,6 +878,15 @@ function dispatch(e) {
       });
       if (!job) fail("not_found", 404);
       return e.json(200, jobView(job));
+    }
+    if (action === "memory-history" || action === "job-evidence") {
+      let result;
+      app.runInTransaction((tx) => {
+        const current = auth(tx, e);
+        result = action === "memory-history" ? evidenceMemory.history(tx, current, data, domainHelpers()) :
+          evidenceMemory.evidence(tx, current, data, domainHelpers());
+      });
+      return e.json(200, result);
     }
     if (action === "auth")
       return e.json(200, {

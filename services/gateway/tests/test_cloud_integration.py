@@ -20,6 +20,69 @@ sys.path.insert(0, str(ROOT / "services/gateway"))
 from app.main import Settings, Route, create_app
 
 
+def test_evidence_and_memory_http_roundtrip_uses_private_snapshot_without_paid_requests():
+    spec = importlib.util.spec_from_file_location("pb_memory_http_fixture", ROOT / "services/pocketbase/tests/test_sync.py")
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    PB = fixture.PocketBaseSyncTests
+    PB.setUpClass()
+    context = PB()
+    context.setUp()
+    conversation = context.conversation()
+    rows = context.call("pull", session=context.session).json()["changes"]
+    message = next(r["record"] for r in rows if r["record"]["entity_type"] == "messages")
+    profile = message["payload"]["profile_uid"]
+    passthrough = httpx.AsyncHTTPTransport()
+
+    async def local_only(request):
+        assert request.url.host == "127.0.0.1", "Read-only evidence/history caused a paid request"
+        return await passthrough.handle_async_request(request)
+
+    settings = Settings(operator_token="operator-" + "x" * 48, pb_url=PB.url,
+        routes={alias: Route("https://provider.example/v1", "fixture", "fixture-key") for alias in ("draft", "strategy")},
+        pb_internal_key=fixture.INTERNAL)
+    headers = {"Authorization": "Bearer " + context.session["token"],
+        "X-Device-Session": context.session["device"]["id"], "X-Device-Secret": context.session["device_secret"]}
+    try:
+        with TestClient(create_app(settings, transport=httpx.MockTransport(local_only), start_worker=False)) as api:
+            memory_uid = str(uuid.uuid4()).upper()
+            operation = dict(op_id=str(uuid.uuid4()), entity_type="memories", entity_uid=memory_uid,
+                base_version=0, action="upsert", payload=dict(profile_uid=profile, text="Synthetic memory",
+                    kind="fact", status="pending", source_uids=[message["uid"]], change_reason="用户创建"))
+            response = api.post("/v1/sync/push", headers=headers,
+                json={"server_epoch": context.epoch, "operations": [operation]})
+            assert response.status_code == 200
+            assert response.json()["results"][0]["status"] == "applied"
+            history = api.get(f"/v1/memories/{memory_uid}/history", headers=headers)
+            assert history.status_code == 200 and history.json()["versions"][0]["version"] == 1
+            assert history.headers["cache-control"] == "no-store"
+            assert api.get(f"/v1/memories/{memory_uid}/history?limit=51", headers=headers).status_code == 422
+            assert api.get(f"/v1/memories/{memory_uid}/history", headers={"Authorization": headers["Authorization"]}).status_code == 401
+            accepted = api.post("/v1/analyses", headers=headers, json=dict(request_id=str(uuid.uuid4()),
+                conversation_uid=conversation, context_revision=1, kind="analysis"))
+            analysis_id = accepted.json()["analysis_id"]
+            claim = context.call("job-claim").json()
+            assert claim["job"]["analysis_id"] == analysis_id
+            result = dict(schema_version=1, analysis_id=analysis_id, conversation_uid=conversation,
+                context_revision=1, evidence=[], facts=["Legacy fact"], candidates=[])
+            assert context.call("job-finish", dict(analysis_id=analysis_id, claim_token=claim["claim_token"],
+                status="succeeded", result=result)).status_code == 200
+            evidence = api.get(f"/v1/analyses/{analysis_id}/evidence", headers=headers)
+            assert evidence.status_code == 200
+            assert evidence.json()["messages"][0]["text"] == "Confirmed test only"
+            assert evidence.json()["evidence"] == []  # v1 remains readable, no invented references
+            assert evidence.headers["cache-control"] == "no-store"
+            assert "fixture-key" not in evidence.text
+            deletion = dict(op_id=str(uuid.uuid4()), entity_type="messages", entity_uid=message["uid"],
+                base_version=1, action="delete", payload={})
+            assert api.post("/v1/sync/push", headers=headers,
+                json={"server_epoch": context.epoch, "operations": [deletion]}).json()["results"][0]["status"] == "applied"
+            assert api.get(f"/v1/analyses/{analysis_id}/evidence", headers=headers).status_code == 404
+            assert api.get(f"/v1/memories/{memory_uid}/history", headers=headers).status_code == 404
+    finally:
+        PB.tearDownClass()
+
+
 @pytest.mark.parametrize("interruption", ["lost_claim_response", "delete_after_first_model"])
 def test_worker_survives_claim_response_loss_and_stops_new_model_calls_after_deletion(interruption):
     spec = importlib.util.spec_from_file_location("pb_worker_fixture", ROOT / "services/pocketbase/tests/test_sync.py")

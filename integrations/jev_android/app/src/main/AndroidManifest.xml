@@ -30,6 +30,7 @@
             android:exported="false" />
 
         <activity android:name=".CloudAccountActivity" android:exported="false" />
+        <activity android:name=".CloudEvidenceMemoryActivity" android:exported="false" />
 
         <activity
             android:name=".CaptureInputActivity"

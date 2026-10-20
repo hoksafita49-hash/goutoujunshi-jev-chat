@@ -137,6 +137,38 @@ class CloudSession:
                     conv["payload"].get("context_revision") == result["context_revision"] and
                     not self.repository.db.has_pending_context(result["profile_uid"], result["conversation_uid"]))
 
+    def _account_operation(self, expected_identity, operation):
+        def action():
+            identity = self.identity if expected_identity is None else expected_identity
+            if identity != self.identity:
+                raise RuntimeError("account_changed")
+            repo = self.require()
+            if repo.db.frozen:
+                raise RuntimeError("server_epoch_changed")
+            value = operation(repo)
+            if identity != self.identity or repo is not self.repository or not self.session:
+                raise RuntimeError("account_changed")
+            return value
+        return self._guard(action)
+
+    def evidence(self, analysis_id, profile_uid, *, expected_identity, **context):
+        return self._account_operation(expected_identity, lambda repo: repo.evidence(analysis_id, profile_uid, **context))
+
+    def memory_history(self, uid, *, expected_identity, **page):
+        return self._account_operation(expected_identity, lambda repo: repo.memory_history(uid, **page))
+
+    def create_memory(self, profile_uid, text, *, expected_identity, **fields):
+        return self._account_operation(expected_identity, lambda repo: repo.create_memory(profile_uid, text, **fields))
+
+    def save_memory(self, uid, *, expected_identity, **fields):
+        return self._account_operation(expected_identity, lambda repo: repo.save_memory(uid, **fields))
+
+    def delete_memory(self, uid, *, expected_identity, **fields):
+        return self._account_operation(expected_identity, lambda repo: repo.delete_memory(uid, **fields))
+
+    def restore_memory(self, uid, revision, *, expected_identity):
+        return self._account_operation(expected_identity, lambda repo: repo.restore_memory(uid, revision))
+
     def close(self):
         for db in self._databases:
             db.close()

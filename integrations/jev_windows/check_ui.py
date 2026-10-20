@@ -65,6 +65,7 @@ def cloud_checks(directory):
         overlay.show(mapped)
         assert [card.text.text() for card in overlay.cards] == mapped["candidates"]
         assert mapped["scores"] == [None, None]
+        assert hasattr(overlay, "evidenceButton"), "The result screen needs a usable evidence entry"
         page = json.loads((fixture.parent / "cloud-v1-sync-page.json").read_text(encoding="utf-8"))
         class FakeGateway:
             def __init__(self, _server, session=None):
@@ -88,6 +89,12 @@ def cloud_checks(directory):
                         for op in body["operations"]])
                 if path == "/v1/auth/logout":
                     return {}
+                if path.endswith("/evidence"):
+                    return dict(analysis_id=mapped["analysis_id"], conversation_uid=mapped["conversation_uid"],
+                        profile_uid=page["changes"][0]["record"]["uid"], context_revision=mapped["context_revision"],
+                        messages=[dict(uid="synthetic-source", version=1, role="other", text="今天有点忙", observed_at="2026-10-21T00:01:00Z")],
+                        evidence=[dict(claim_id="synthetic-claim", kind="fact", text="对方说今天有点忙", source_message_uids=["synthetic-source"],
+                            source_quotes=[dict(message_uid="synthetic-source", quote="今天有点忙")], citation_status="verified")])
                 raise AssertionError("Unexpected UI network call: " + path)
         def finish():
             deadline = time.monotonic() + 5
@@ -108,15 +115,32 @@ def cloud_checks(directory):
             overlay.cloudPanel.sync()
             finish()
             assert not cloud_runtime.current().require().db.operations()
+            mapped.update(profile_uid=page["changes"][0]["record"]["uid"], cloud_identity=cloud_runtime.current().identity)
+            overlay.show(mapped)
+            assert not overlay.evidenceButton.isHidden()
+            overlay.evidenceButton.click()
+            evidence = overlay.cloudPanel.account_dialogs[-1]
+            deadline = time.monotonic() + 5
+            while evidence.busy and time.monotonic() < deadline:
+                overlay.app.processEvents()
+                time.sleep(.01)
+            assert not evidence.busy
+            assert "对方" in evidence.view.toPlainText() and "分析当时" in evidence.view.toPlainText()
+            overlay.cloudPanel.memory_button.click()
+            memories = overlay.cloudPanel.account_dialogs[-1]
+            assert memories.isVisible() and memories.chooser.count() >= 1
         if os.environ.get("GOUTOU_UI_SNAPSHOT_DIR"):
             out = Path(os.environ["GOUTOU_UI_SNAPSHOT_DIR"])
             out.mkdir(parents=True, exist_ok=True)
             overlay.win.resize(450, 800)
             overlay.app.processEvents()
             overlay.win.grab().save(str(out / "windows-cloud-settings.png"))
+            evidence.grab().save(str(out / "windows-cloud-evidence.png"))
+            memories.grab().save(str(out / "windows-cloud-memories.png"))
         overlay.cloudPanel.logout()
         finish()
         assert not cloud_runtime.current().session and overlay.cloudPanel.people.count() == 0
+        assert not evidence.isVisible() and not evidence.view.toPlainText() and not memories.isVisible()
         overlay.cloudPanel.timer.stop()
         overlay.win.close()
     cloud_runtime._service.close()

@@ -9,6 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import java.security.MessageDigest
 
 /** One physical SQLite file per server/account. All visible edits and their outbox are atomic. */
 class LocalDatabase private constructor(context: Context, val account: String) : SQLiteOpenHelper(context,
@@ -23,6 +24,13 @@ class LocalDatabase private constructor(context: Context, val account: String) :
         db.execSQL("CREATE TABLE jobs(k TEXT PRIMARY KEY,body TEXT NOT NULL,analysis_id TEXT,result TEXT)")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onOpen(db: SQLiteDatabase) {
+        super.onOpen(db)
+        if (!db.isReadOnly) {
+            db.beginTransaction()
+            try { purgeDeletedAnalysisCaches(db); db.setTransactionSuccessful() } finally { db.endTransaction() }
+        }
+    }
     @Synchronized fun <T> transaction(block: (SQLiteDatabase) -> T): T {
         val db = writableDatabase
         db.beginTransaction()
@@ -45,6 +53,8 @@ class LocalDatabase private constructor(context: Context, val account: String) :
         if (remote != null && !remote.isNull("deleted_at")) return remote
         return row(db, type, uid, "local") ?: remote
     }
+    @Synchronized fun hasLocalChanges(type: String, uid: String): Boolean = readableDatabase.rawQuery(
+        "SELECT local IS NOT NULL FROM records WHERE type=? AND uid=?", arrayOf(type, uid)).use { it.moveToFirst() && it.getInt(0) != 0 }
     @Synchronized fun records(type: String): List<JSONObject> = readableDatabase.rawQuery(
         "SELECT local,remote FROM records WHERE type=? ORDER BY rowid", arrayOf(type)).use { c ->
         buildList { while (c.moveToNext()) {
@@ -131,8 +141,10 @@ class LocalDatabase private constructor(context: Context, val account: String) :
         val type = record.getString("entity_type"); val uid = record.getString("uid")
         val old = row(db, type, uid, "remote")
         if (old != null && old.optInt("version") > record.getInt("version")) return
+        if (type == "analyses" && old != null && !old.isNull("deleted_at") && record.isNull("deleted_at")) return
         db.execSQL("INSERT OR IGNORE INTO records(type,uid) VALUES(?,?)", arrayOf(type, uid))
         db.update("records", ContentValues().apply { put("remote", record.toString()) }, "type=? AND uid=?", arrayOf(type, uid))
+        if (type == "analyses" && !record.isNull("deleted_at")) cancelAnalysisJobs(db, uid)
     }
     fun applyPage(page: JSONObject) = transaction { db ->
         val changes = page.getJSONArray("changes")
@@ -220,29 +232,101 @@ class LocalDatabase private constructor(context: Context, val account: String) :
             db.insertOrThrow("legacy_id_map", null, ContentValues().apply { put("source", source); put("uid", uid) })
         }
     }
-    @Synchronized fun job(key: String): JSONObject? = readableDatabase.rawQuery("SELECT body,analysis_id,result FROM jobs WHERE k=?", arrayOf(key)).use {
-        if (!it.moveToFirst()) null else JSONObject().put("body", JSONObject(it.getString(0)))
-            .put("analysis_id", if (it.isNull(1)) JSONObject.NULL else it.getString(1))
-            .put("result", if (it.isNull(2)) JSONObject.NULL else JSONObject(it.getString(2)))
+    private fun deletedJobKey(key: String): String = if (key.startsWith("deleted/")) key else "deleted/" +
+        MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    private fun readJob(db: SQLiteDatabase, key: String): JSONObject? {
+        val deleted = deletedJobKey(key)
+        return db.rawQuery("SELECT k,body,analysis_id,result FROM jobs WHERE k IN (?,?) ORDER BY CASE WHEN k=? THEN 0 ELSE 1 END LIMIT 1",
+            arrayOf(key, deleted, deleted)).use {
+            if (!it.moveToFirst()) null else JSONObject().put("body", JSONObject(it.getString(1)))
+                .put("analysis_id", if (it.isNull(2)) JSONObject.NULL else it.getString(2))
+                .put("result", if (it.isNull(3)) JSONObject.NULL else JSONObject(it.getString(3)))
+                .put("local_cancelled", it.getString(0).startsWith("deleted/"))
+        }
     }
-    fun saveJob(key: String, body: JSONObject, analysisId: String? = null, result: JSONObject? = null) = transaction { db ->
+    @Synchronized fun job(key: String): JSONObject? = readJob(readableDatabase, key)
+    private fun analysisDeleted(db: SQLiteDatabase, uid: String?): Boolean = !uid.isNullOrBlank() &&
+        row(db, "analyses", uid, "remote")?.isNull("deleted_at") == false
+    private fun redactJobBody(body: JSONObject): JSONObject = JSONObject().apply {
+        for (key in listOf("request_id", "conversation_uid", "context_revision", "kind", "parent_analysis_id", "profile_uid"))
+            if (body.has(key)) put(key, body.get(key))
+    }
+    private fun requestIdentity(body: JSONObject): String = JSONObject(body.toString()).apply { remove("request_id") }.toString()
+    private fun cancelJob(db: SQLiteDatabase, key: String, body: JSONObject, analysisId: String?) {
+        val ledgerKey = deletedJobKey(key)
+        val ledger = readJob(db, ledgerKey)?.takeIf { it.optBoolean("local_cancelled") }
+        val preservedBody = ledger?.getJSONObject("body") ?: body
+        val preservedId = if (ledger == null) analysisId else ledger.optString("analysis_id").takeUnless { it.isBlank() || it == "null" }
+        if (key != ledgerKey) db.delete("jobs", "k=?", arrayOf(key))
         db.insertWithOnConflict("jobs", null, ContentValues().apply {
-            put("k", key); put("body", body.toString()); put("analysis_id", analysisId); put("result", result?.toString())
+            put("k", ledgerKey); put("body", redactJobBody(preservedBody).toString()); put("analysis_id", preservedId); putNull("result")
         }, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+    private fun cancelAnalysisJobs(db: SQLiteDatabase, uid: String) {
+        val archivedBodies = HashSet<String>()
+        val archives = ArrayList<Pair<String, JSONObject>>()
+        db.rawQuery("SELECT k,v FROM meta WHERE k LIKE 'previous_job/%'", null).use { c ->
+            while (c.moveToNext()) archives.add(c.getString(0) to JSONObject(c.getString(1)))
+        }
+        fun belongs(snapshot: JSONObject): Boolean = snapshot.optString("analysis_id") == uid ||
+            snapshot.optJSONObject("result")?.optString("analysis_id") == uid ||
+            snapshot.optJSONObject("body")?.optString("parent_analysis_id") == uid
+        for ((key, snapshot) in archives) if (belongs(snapshot)) {
+            val body = snapshot.getJSONObject("body")
+            archivedBodies.add(requestIdentity(body))
+            meta(db, key, JSONObject().put("body", redactJobBody(body)).put("analysis_id", snapshot.opt("analysis_id") ?: JSONObject.NULL)
+                .put("result", JSONObject.NULL).put("local_cancelled", true).toString())
+        }
+        val jobs = ArrayList<Pair<String, JSONObject>>()
+        db.rawQuery("SELECT k,body,analysis_id,result FROM jobs", null).use { c -> while (c.moveToNext()) {
+            jobs.add(c.getString(0) to JSONObject().put("body", JSONObject(c.getString(1)))
+                .put("analysis_id", if (c.isNull(2)) JSONObject.NULL else c.getString(2))
+                .put("result", if (c.isNull(3)) JSONObject.NULL else JSONObject(c.getString(3))))
+        } }
+        for ((key, snapshot) in jobs) if (belongs(snapshot) || requestIdentity(snapshot.getJSONObject("body")) in archivedBodies)
+            cancelJob(db, key, snapshot.getJSONObject("body"), snapshot.optString("analysis_id").takeUnless { it.isBlank() || it == "null" })
+    }
+    private fun purgeDeletedAnalysisCaches(db: SQLiteDatabase) {
+        val deleted = ArrayList<String>()
+        db.rawQuery("SELECT uid,remote FROM records WHERE type='analyses' AND remote IS NOT NULL", null).use { c ->
+            while (c.moveToNext()) if (!JSONObject(c.getString(1)).isNull("deleted_at")) deleted.add(c.getString(0))
+        }
+        deleted.forEach { cancelAnalysisJobs(db, it) }
+    }
+    fun saveJob(key: String, body: JSONObject, analysisId: String? = null, result: JSONObject? = null) {
+        val cancelled = transaction { db ->
+            val previous = readJob(db, key)
+            if (previous?.optBoolean("local_cancelled") == true) return@transaction true
+            if (analysisDeleted(db, analysisId) || analysisDeleted(db, result?.optString("analysis_id")) ||
+                analysisDeleted(db, previous?.optString("analysis_id")) || analysisDeleted(db, body.optString("parent_analysis_id"))) {
+                cancelJob(db, key, previous?.getJSONObject("body") ?: body,
+                    previous?.optString("analysis_id")?.takeUnless { it.isBlank() || it == "null" } ?: analysisId)
+                return@transaction true
+            }
+            db.insertWithOnConflict("jobs", null, ContentValues().apply {
+                put("k", key); put("body", body.toString()); put("analysis_id", analysisId); put("result", result?.toString())
+            }, SQLiteDatabase.CONFLICT_REPLACE)
+            false
+        }
+        // Commit the cancellation ledger before stopping a late network caller from displaying its result.
+        check(!cancelled) { "原分析或来源已删除；已清除正文并保留请求编号，禁止恢复或重放此任务" }
     }
     @Synchronized fun jobs(): List<JSONObject> = readableDatabase.rawQuery("SELECT k,body,analysis_id,result FROM jobs ORDER BY rowid DESC", null).use { c ->
         buildList { while (c.moveToNext()) add(JSONObject().put("key", c.getString(0)).put("body", JSONObject(c.getString(1)))
-            .put("analysis_id", if (c.isNull(2)) JSONObject.NULL else c.getString(2)).put("completed", !c.isNull(3))) }
+            .put("analysis_id", if (c.isNull(2)) JSONObject.NULL else c.getString(2)).put("completed", !c.isNull(3))
+            .put("local_cancelled", c.getString(0).startsWith("deleted/"))) }
     }
     /** Explicit user choice only. Never called as an automatic retry or timeout handler. */
     fun allowNewJob(key: String) = transaction { db ->
-        val previous = checkNotNull(job(key))
+        val previous = checkNotNull(readJob(db, key))
+        check(!previous.optBoolean("local_cancelled")) { "原分析或来源已删除，此任务不能重新请求；请核对新的对话上下文" }
         meta(db, "previous_job/${UUID.randomUUID()}", previous.toString())
         val body = previous.getJSONObject("body").put("request_id", UUID.randomUUID().toString())
         db.execSQL("UPDATE jobs SET body=?,analysis_id=NULL,result=NULL WHERE k=?", arrayOf(body.toString(), key))
     }
     /** Logical export includes unsent edits, conflicts and task request IDs without credentials. */
     fun exportRecovery(directory: File): File = transaction { db ->
+        purgeDeletedAnalysisCaches(db)
         directory.mkdirs()
         val export = JSONObject().put("account", account).put("exported_at", CloudProtocol.now())
         for (table in listOf("records", "outbox", "conflicts", "meta", "legacy_id_map", "jobs")) {
