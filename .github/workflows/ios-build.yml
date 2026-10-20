@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   ios:
-    runs-on: macos-latest
+    runs-on: macos-15
     defaults:
       run:
         working-directory: integrations/jev_ios
