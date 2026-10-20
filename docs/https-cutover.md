@@ -42,8 +42,10 @@ it read the same synthetic person,2memories,2analyses and the3-version correctio
 history. The deployment's USB reverse on port18000 was then removed and a fresh
 native HTTPS sync succeeded with zero pending/conflicts/rejections. Read-only
 ConnectivityService inspection showed CELLULAR as the default transport. USB was
-still physically connected during that observed check; the owner was separately
-asked to confirm a physically unplugged mobile-data sync. Android's native UI
+still physically connected during that observed check. On2026-10-21 the owner
+then reported successful sync after following the requested physical USB unplug,
+Wi-Fi off and mobile-data-only steps. This final physical check is owner-reported,
+separate from the tool-observed checks above. Android's native UI
 does not expose a total message count, so no phone-cache message-count equality
 claim is made. The native default preferences also matched natural/short/3/empty
 style without editing them.
