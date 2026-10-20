@@ -1,0 +1,30 @@
+[Unit]
+Description=Goutou private PocketBase
+After=network.target
+
+[Service]
+Type=simple
+User=goutou-pb
+Group=goutou-pb
+WorkingDirectory=/var/lib/goutou/pocketbase
+EnvironmentFile=/etc/goutou/pocketbase.env
+ExecStart=/opt/goutou/pocketbase-0.40.5/pocketbase serve --http=127.0.0.1:8090 --dir=/var/lib/goutou/pocketbase --hooksDir=/opt/goutou/current/services/pocketbase/pb_hooks --migrationsDir=/opt/goutou/current/services/pocketbase/pb_migrations --automigrate=false --hooksWatch=false
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/goutou/pocketbase
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

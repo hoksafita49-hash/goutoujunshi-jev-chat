@@ -28,6 +28,13 @@ import com.jev.probe.core.kb.ChatContext
 import com.jev.probe.core.kb.ContextBuilder
 import com.jev.probe.core.kb.KbStore
 import com.jev.probe.jev.JevClient
+import com.jev.probe.cloud.CloudAnalysis
+import com.jev.probe.cloud.CloudRuntime
+import com.jev.probe.cloud.CloudAccountBinding
+import com.jev.probe.cloud.CloudAccountBoundary
+import com.jev.probe.cloud.CloudReview
+import com.jev.probe.cloud.AndroidCloudSessionAccess
+import com.jev.probe.cloud.CloudRewrite
 import com.jev.probe.jev.ExplanationFormat
 import com.jev.probe.jev.VisionClient
 import com.jev.probe.overlay.OverlayController
@@ -95,6 +102,7 @@ open class ChatCaptureService : AccessibilityService() {
     private var overlay: OverlayController? = null
     private val session = CaptureSession { ::prefs.isInitialized && prefs.enabled }
     private var detachPrefs: (() -> Unit)? = null
+    private var detachCloudAccount: (() -> Unit)? = null
 
     private var lastSignature: String = ""
     private var activePkg: String? = null
@@ -136,6 +144,9 @@ open class ChatCaptureService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         prefs = Prefs(this)
+        detachCloudAccount = CloudAccountBoundary.observe {
+            main.post { cancelWork(); overlay?.hide() }
+        }
         session.setEnabled(prefs.enabled)
         overlay = OverlayController(this)
         overlay?.onHidden = { cancelWork() }
@@ -155,20 +166,37 @@ open class ChatCaptureService : AccessibilityService() {
         }
         overlay?.onDetails = { requestExplanation() }
         overlay?.onExplain = { candidate -> requestExplanation(candidate) }
-        overlay?.onRewrite = {
+        overlay?.onRewrite = rewrite@ { selectedText ->
             val snapshot = lastAnalyzedSnapshot
             val analysis = lastAnalysis
             val ctx = lastContext
             val token = session.current
             val pkg = activePkg ?: foregroundPkg ?: ""
-            if (snapshot == null || analysis == null || analysis.rankedReplies.isEmpty() ||
+            if (snapshot == null || analysis == null || analysis.rankedReplies.none { it.text == selectedText } ||
                 !snapshotIsCurrent(snapshot, pkg)) {
                 overlay?.toast("请先生成当前会话的候选")
             } else {
+                val cloudMode = analysis.cloudAccount != null
+                if (prefs.cloudEnabled != cloudMode) { overlay?.toast("运行方式已改变，请重新分析"); return@rewrite }
+                val cloudBinding = if (cloudMode) try { CloudAccountBinding.capture(AndroidCloudSessionAccess(this)) }
+                    catch (e: Exception) { overlay?.toast(e.message ?: "请重新登录"); null } else null
+                if (cloudMode && cloudBinding == null) return@rewrite
                 overlay?.toast("正在按你的原话调整口吻…")
                 submit(token) {
                     val client = JevClient(prefs)
                     try {
+                        if (cloudMode) {
+                            val captured = checkNotNull(cloudBinding)
+                            captured.assertCurrent()
+                            val result = CloudAnalysis(this, binding = captured).followup(analysis, "rewrite", selectedText)
+                            val rewritten = CloudRewrite.read(result, analysis, selectedText)
+                            main.post {
+                                if (CloudRuntime.current(this, captured.session) && CloudRuntime.analysisCurrent(this, analysis, snapshot.title, pkg) && session.isCurrent(token) && snapshotIsCurrent(snapshot, pkg)) {
+                                    overlay?.showRewriteVariant(rewritten.selectedText, rewritten.text) { text -> fillInput(text, snapshot, pkg) }
+                                }
+                            }
+                            return@submit
+                        }
                         val candidates = client.rewrite(snapshot, analysis,
                             analysis.rankedReplies.map { it.text })
                         val ranked = client.rerank(snapshot, prefs.relationship, analysis, candidates, ctx)
@@ -192,6 +220,10 @@ open class ChatCaptureService : AccessibilityService() {
             when {
                 title.isNullOrBlank() -> overlay?.toast("当前会话没有标题，存不了")
                 isTransientTitle(title) -> overlay?.toast("当前会话标题还没加载出来，稍后再试")
+                prefs.cloudEnabled -> {
+                    startActivity(Intent(this, com.jev.probe.CloudAccountActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("chat_title", title).putExtra("chat_app", pkg))
+                }
                 else -> submit {
                     val msg = try {
                         KbStore.get(this).saveOrMergeContact(title, pkg)
@@ -421,6 +453,9 @@ open class ChatCaptureService : AccessibilityService() {
             return
         }
         val heading = if (candidate == null) "详细分析" else "回复理由与代价"
+        val cloudMode = prefs.cloudEnabled
+        val cloudBinding = if (cloudMode) try { CloudAccountBinding.capture(AndroidCloudSessionAccess(this)) }
+            catch (e: Exception) { overlay?.toast(e.message ?: "请重新登录"); return } else null
         val generation = ++explanationGeneration
         val requestToken = WorkToken { session.isCurrent(token) }
         val detach = token.onCancel { requestToken.cancel() }
@@ -434,12 +469,21 @@ open class ChatCaptureService : AccessibilityService() {
         submit(token) {
             try {
                 val result = WorkScope.run(requestToken) {
-                    val client = JevClient(prefs)
-                    if (candidate == null) client.details(snapshot, prefs.relationship, analysis, ctx)
-                    else client.explain(snapshot, prefs.relationship, analysis, candidate, ctx)
+                    if (cloudMode) {
+                        val captured = checkNotNull(cloudBinding)
+                        captured.assertCurrent()
+                        CloudAnalysis(this, binding = captured).followup(analysis, "explanation", candidate).getString("text")
+                    } else {
+                        check(analysis.cloudAccount == null) { "运行方式已改变，请重新分析" }
+                        val client = JevClient(prefs)
+                        if (candidate == null) client.details(snapshot, prefs.relationship, analysis, ctx)
+                        else client.explain(snapshot, prefs.relationship, analysis, candidate, ctx)
+                    }
                 }
                 main.post {
-                    if (generation == explanationGeneration && session.isCurrent(token) && snapshotIsCurrent(snapshot, pkg))
+                    val accountCurrent = if (analysis.cloudAccount == null) !prefs.cloudEnabled else
+                        CloudRuntime.analysisCurrent(this, analysis, snapshot.title, pkg)
+                    if (accountCurrent && generation == explanationGeneration && session.isCurrent(token) && snapshotIsCurrent(snapshot, pkg))
                         overlay?.showDetails(result, heading)
                 }
             } catch (e: CancellationException) {
@@ -456,17 +500,42 @@ open class ChatCaptureService : AccessibilityService() {
         }
     }
 
-    private fun runAnalysis(token: WorkToken = session.current) {
+    private fun runAnalysis(token: WorkToken = session.current, review: CloudReview? = null) {
         if (!session.isCurrent(token) || session.analyzing) return
+        if (prefs.cloudEnabled != (review != null)) { cancelWork(); overlay?.showError("运行方式已切换，请重新核对"); return }
+        try { review?.binding?.assertCurrent() } catch (_: CancellationException) { cancelWork(); overlay?.showError("云账号已切换，请重新核对"); return }
         val snapshot = pendingSnapshot ?: return
         pendingSnapshot = null
         val pkg = activePkg ?: foregroundPkg ?: ""
         if (!snapshotIsCurrent(snapshot, pkg)) return
         if (!prefs.hasKey() && !GoutouGuidance.explicitBoundary(snapshot)) {
-            overlay?.showError("未设置判断接口密钥，去设置里填"); return
+            overlay?.showError(if (prefs.cloudEnabled) "请到设置登录云账号" else "未设置判断接口密钥，去设置里填"); return
         }
         if (!session.beginAnalysis(token)) return
         overlay?.showLoading(); overlay?.setNote(snapshot.note); overlay?.setSnapshot(snapshot)
+        if (review != null) {
+            val cloudSession = try { checkNotNull(review).binding.withCurrent { it } } catch (e: Exception) {
+                finishAnalysis(token, snapshot, pkg) { overlay?.showError(e.message ?: "请先登录") }; return
+            }
+            submit(token) {
+                try {
+                    val boundReview = checkNotNull(review)
+                    boundReview.binding.assertCurrent()
+                    val analysis = CloudAnalysis(this, binding = boundReview.binding).analyze(snapshot, pkg, boundReview.source, boundReview.profileUid)
+                    finishAnalysis(token, snapshot, pkg) {
+                        if (CloudRuntime.current(this, cloudSession) && CloudRuntime.analysisCurrent(this, analysis, snapshot.title, pkg)) {
+                            lastAnalysis = analysis; lastAnalyzedSnapshot = snapshot; lastContext = null
+                            overlay?.showJudgment(analysis)
+                            overlay?.showReplies(analysis.rankedReplies) { text -> fillInput(text, snapshot, pkg) }
+                        }
+                    }
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) {
+                    finishAnalysis(token, snapshot, pkg) { if (CloudRuntime.current(this, cloudSession)) overlay?.showError(e.message ?: "云分析失败，任务与队列已保留") }
+                }
+            }
+            return
+        }
         val client = JevClient(prefs)
         val rel = prefs.relationship
         submit(token) {
@@ -486,7 +555,7 @@ open class ChatCaptureService : AccessibilityService() {
             if (judgment.error != null) {
                 finishAnalysis(token, snapshot, pkg) { overlay?.showError(judgment.error) }
             } else {
-                main.post { if (session.isCurrent(token) && snapshotIsCurrent(snapshot, pkg)) overlay?.showJudgment(judgment) }
+                main.post { if (!prefs.cloudEnabled && session.isCurrent(token) && snapshotIsCurrent(snapshot, pkg)) overlay?.showJudgment(judgment) }
                 token.checkActive()
                 var replyError: String? = null
                 val ranked = try { client.draftAndRank(snapshot, rel, ctx, judgment) } catch (e: Exception) {
@@ -494,6 +563,7 @@ open class ChatCaptureService : AccessibilityService() {
                     emptyList()
                 }
                 finishAnalysis(token, snapshot, pkg) {
+                    if (prefs.cloudEnabled) return@finishAnalysis
                     lastAnalysis = judgment.copy(rankedReplies = ranked)
                     lastAnalyzedSnapshot = snapshot
                     lastContext = ctx
@@ -697,6 +767,10 @@ open class ChatCaptureService : AccessibilityService() {
 
     /** One cropped image per round, rather than a paid request for every bubble. */
     private fun ocrCloud(bmp: Bitmap, title: String?, pkg: String, manual: Boolean, token: WorkToken, cropChatArea: Boolean = true) {
+        if (prefs.cloudEnabled) {
+            ocrWholeScreen(bmp, title, pkg, manual, token, cropChatArea)
+            return
+        }
         val top = if (cropChatArea) (bmp.height * TOP_CROP).toInt().coerceIn(0, bmp.height - 1) else 0
         val bottom = if (cropChatArea) (bmp.height * BOTTOM_CROP).toInt().coerceIn(top + 1, bmp.height) else bmp.height
         val crop = Bitmap.createBitmap(bmp, 0, top, bmp.width, bottom - top)
@@ -848,11 +922,19 @@ open class ChatCaptureService : AccessibilityService() {
     /** Both tree extraction and OCR require a reviewed transcript before model calls. */
     private fun reviewSnapshot(snapshot: ChatSnapshot, pkg: String) {
         if (!snapshotIsCurrent(snapshot, pkg)) return
+        val cloudReview = if (prefs.cloudEnabled) try {
+            val binding = CloudAccountBinding.capture(AndroidCloudSessionAccess(this))
+            val person = binding.withCurrent { com.jev.probe.data.ContactRepository(this, it).findContact(snapshot.title ?: "已确认对话", pkg)?.id }
+            CloudReview(binding, snapshot, pkg, person)
+        } catch (e: Exception) { overlay?.showError(e.message ?: "请先登录云账号"); return } else null
         val token = session.beginReview() ?: return
         overlay?.showReview(snapshot, onConfirm = { confirmed ->
             if (!session.isCurrent(token) || !session.reviewPending) return@showReview
+            try { cloudReview?.binding?.assertCurrent() } catch (_: CancellationException) {
+                cancelWork(); overlay?.showError("云账号已切换，请重新核对"); return@showReview
+            }
             overlay?.showLoading()
-            completeReviewConfirmation(confirmed, pkg, token)
+            completeReviewConfirmation(confirmed, pkg, token, cloudReview)
         }, onCancel = {
             if (session.isCurrent(token)) {
                 cancelWork()
@@ -873,15 +955,18 @@ open class ChatCaptureService : AccessibilityService() {
         confirmed: ChatSnapshot,
         pkg: String,
         token: WorkToken,
+        cloudReview: CloudReview?,
         attempt: Int = 0
     ) {
         if (!session.isCurrent(token) || !session.reviewPending) return
+        if (prefs.cloudEnabled != (cloudReview != null)) { cancelWork(); overlay?.showError("运行方式已切换，请重新核对"); return }
+        try { cloudReview?.binding?.assertCurrent() } catch (_: CancellationException) { cancelWork(); overlay?.showError("云账号已切换，请重新核对"); return }
         val livePkg = rootInActiveWindow?.packageName?.toString()
         when (reviewConfirmationState(livePkg, packageName, pkg)) {
             ReviewConfirmationState.WAIT_FOR_CHAT_WINDOW -> {
                 if (attempt < REVIEW_FOCUS_RETRIES) {
                     main.postDelayed({
-                        completeReviewConfirmation(confirmed, pkg, token, attempt + 1)
+                        completeReviewConfirmation(confirmed, pkg, token, cloudReview, attempt + 1)
                     }, REVIEW_FOCUS_RETRY_MS)
                 } else {
                     cancelWork()
@@ -898,7 +983,7 @@ open class ChatCaptureService : AccessibilityService() {
                 currentSnapshot = confirmed
                 pendingSnapshot = confirmed
                 main.removeCallbacks(debounce)
-                runAnalysis(token)
+                runAnalysis(token, cloudReview)
             }
         }
     }
@@ -1001,6 +1086,8 @@ open class ChatCaptureService : AccessibilityService() {
         super.onDestroy()
         detachPrefs?.invoke()
         detachPrefs = null
+        detachCloudAccount?.invoke()
+        detachCloudAccount = null
         session.destroy()
         cancelWork()
         // Tear the overlay down and cut its callback so a stale button tap can

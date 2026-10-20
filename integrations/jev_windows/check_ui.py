@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """Headless construction smoke test for the packaged Qt views."""
 import os
+import json
+from pathlib import Path
+import tempfile
+import time
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -8,6 +13,10 @@ import main as windows_main  # smoke-import the actual Windows capture/fill orch
 from app.overlay import Overlay
 from app.review import ReviewDialog
 from app.trend_ui import TrendWindow
+from app import settings, cloud_runtime
+from app.gateway import result_for_ui
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QFontDatabase
 
 
 def main():
@@ -42,5 +51,89 @@ def main():
     print("windows ui ok")
 
 
+def cloud_checks(directory):
+    settings.save(cloud_mode_on=True, cloud_server_text="http://127.0.0.1:18000")
+    cloud_runtime._service = cloud_runtime.CloudSession(settings.cloud_server(), directory / "cloud")
+    with patch.object(settings, "_get_key", side_effect=AssertionError("Cloud mode read a vendor key")):
+        overlay = Overlay(on_fill=lambda _text: None, result_of=lambda _title: None)
+        overlay.open_settings()
+        assert overlay.modelsSurface.isHidden() and overlay.ocrSurface.isHidden()
+        assert overlay.cloudPanel.mode.currentIndex() == 1
+        assert settings.ocr_provider() == "local"
+        fixture = Path(__file__).resolve().parents[2] / "contracts/fixtures/cloud-v1-result.json"
+        mapped = result_for_ui(json.loads(fixture.read_text(encoding="utf-8")))
+        overlay.show(mapped)
+        assert [card.text.text() for card in overlay.cards] == mapped["candidates"]
+        assert mapped["scores"] == [None, None]
+        page = json.loads((fixture.parent / "cloud-v1-sync-page.json").read_text(encoding="utf-8"))
+        class FakeGateway:
+            def __init__(self, _server, session=None):
+                self.session = session
+            def login(self, email, _password, _device):
+                self.session = dict(token="synthetic-ui-token", user=dict(id="synthetic-ui-user", email=email),
+                                    device=dict(id="synthetic-device"), device_secret="synthetic-secret",
+                                    server_epoch=page["server_epoch"])
+                return self.session
+            def refresh(self):
+                return self.session
+            def request(self, method, path, body=None):
+                if path == "/v1/config":
+                    return dict(server_epoch=page["server_epoch"], api_version=1, min_client_version=1, sync_ready=True)
+                if path.startswith("/v1/sync/pull"):
+                    return page
+                if path == "/v1/sync/push":
+                    return dict(server_epoch=page["server_epoch"], results=[dict(op_id=op["op_id"], status="applied",
+                        record=dict(entity_type=op["entity_type"], uid=op["entity_uid"], version=op["base_version"]+1,
+                                    payload=op["payload"], created_at="2026-10-21T00:00:00Z", updated_at="2026-10-21T00:00:00Z", deleted_at=None))
+                        for op in body["operations"]])
+                if path == "/v1/auth/logout":
+                    return {}
+                raise AssertionError("Unexpected UI network call: " + path)
+        def finish():
+            deadline = time.monotonic() + 5
+            while overlay.cloudPanel.busy and time.monotonic() < deadline:
+                overlay.app.processEvents()
+                time.sleep(.01)
+            assert not overlay.cloudPanel.busy, "UI background callback did not arrive"
+        with patch.object(cloud_runtime, "GatewayClient", FakeGateway):
+            overlay.cloudPanel.email.setText("ui-test@example.test")
+            overlay.cloudPanel.password.setText("synthetic-password")
+            overlay.cloudPanel.login()
+            finish()
+            assert not overlay.cloudPanel.password.text()
+            assert overlay.cloudPanel.people.count() == 1
+            overlay.cloudPanel.name.setText("离线新建人物")
+            overlay.cloudPanel.create_profile()
+            assert overlay.cloudPanel.people.count() == 2
+            overlay.cloudPanel.sync()
+            finish()
+            assert not cloud_runtime.current().require().db.operations()
+        if os.environ.get("GOUTOU_UI_SNAPSHOT_DIR"):
+            out = Path(os.environ["GOUTOU_UI_SNAPSHOT_DIR"])
+            out.mkdir(parents=True, exist_ok=True)
+            overlay.win.resize(450, 800)
+            overlay.app.processEvents()
+            overlay.win.grab().save(str(out / "windows-cloud-settings.png"))
+        overlay.cloudPanel.logout()
+        finish()
+        assert not cloud_runtime.current().session and overlay.cloudPanel.people.count() == 0
+        overlay.cloudPanel.timer.stop()
+        overlay.win.close()
+    cloud_runtime._service.close()
+    cloud_runtime._service = None
+    print("windows cloud ui ok")
+
+
 if __name__ == "__main__":
-    main()
+    qt_app = QApplication.instance() or QApplication([])
+    # Windows' offscreen platform has no system font database in a sandbox.
+    # Load installed fonts for visual QA only; never copy them into the package.
+    if not QFontDatabase.families():
+        for name in ("msyh.ttc", "segoeui.ttf"):
+            font = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / name
+            if font.exists():
+                QFontDatabase.addApplicationFont(str(font))
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(settings, "_CONFIG", str(Path(directory) / "config.json")), patch.object(settings, "_get_key", return_value=""):
+            main()
+            cloud_checks(Path(directory))

@@ -54,10 +54,37 @@ def context() -> int:
 
 def style() -> str:
     """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
+    if cloud_mode():
+        from .cloud_runtime import current
+        try:
+            row = current().require().db.visible("preferences", "00000000-0000-4000-8000-000000000001")
+            return str((row or {}).get("payload", {}).get("style", ""))
+        except RuntimeError:
+            return ""
     return str(_read("style") or "")
+
+
+def cloud_mode() -> bool:
+    return _read("connection_mode", "direct") == "cloud"
+
+
+def cloud_server() -> str:
+    return str(_read("cloud_server") or "https://api.zovoeh.cn")
 
 def profile_of(title: str) -> dict:
     """Opt-in per-conversation context; never stores a transcript."""
+    if cloud_mode():
+        from .cloud_runtime import current
+        try:
+            service = current()
+            uid, _ = service.require().conversation_for(target_app(), title, service.source_device)
+            row = service.require().db.visible("profiles", uid)
+            payload = row["payload"]
+            return {**{key: payload.get(key, default) for key, default in
+                    (("stage", "未填写"), ("goal", "自然接话"), ("background", ""))},
+                    "_cloud_uid": uid, "_cloud_version": row["version"], "_cloud_original": payload}
+        except (RuntimeError, ValueError):
+            return dict(stage="未填写", goal="自然接话", background="")
     data = _read("app_profiles", {})
     scoped = data.get(target_app(), {}) if isinstance(data, dict) else {}
     row = scoped.get(title) if isinstance(scoped, dict) else None
@@ -69,9 +96,22 @@ def profile_of(title: str) -> dict:
     return {"stage": row.get("stage", "未填写"), "goal": row.get("goal", "自然接话"),
             "background": row.get("background", "")}
 
-def save_profile(title: str, stage: str, goal: str, background: str) -> None:
+def save_profile(title: str, stage: str, goal: str, background: str, *, expected_uid=None, expected_version=None, original_payload=None) -> None:
     if not title or len(title) > 200 or stage not in STAGES or goal not in GOALS or len(background) > 200:
         raise ValueError("请确认会话、阶段和目标；补充背景最多 200 字")
+    if cloud_mode():
+        from .cloud_runtime import current
+        service = current()
+        uid, _ = service.require().conversation_for(target_app(), title, service.source_device)
+        if expected_uid and expected_uid != uid:
+            raise ValueError("当前人物关联已变化，请重新打开设置核对")
+        row = service.require().db.visible("profiles", uid)
+        payload = row["payload"]
+        if original_payload == payload:
+            expected_version = row["version"]
+        service.require().db.save("profiles", uid, {**payload, "stage": stage, "goal": goal, "background": background},
+                                  expected_version=expected_version)
+        return
     try:
         with open(_CONFIG, encoding="utf-8") as handle:
             data = json.load(handle)
@@ -143,6 +183,8 @@ def auto_analyze() -> bool:
     return bool(_read("auto_analyze", False))
 
 def ocr_provider() -> str:
+    if cloud_mode():
+        return "local"  # This phase has no gateway OCR endpoint; never use a device vendor key.
     value = _read("ocr_provider", "local")
     return value if value in ("local", "deepseek", "openrouter") else "local"
 
@@ -212,7 +254,11 @@ def llm_key() -> str:
 def has_llm_key() -> bool:
     return bool(llm_key())
 
-has_key = has_strategy_key
+def has_key() -> bool:
+    if cloud_mode():
+        from .cloud_runtime import current
+        return bool(current().session)
+    return has_strategy_key()
 
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
@@ -224,7 +270,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          strategy_provider_text: str | None = None, strategy_model_text: str | None = None,
          strategy_key_text: str | None = None, auto_analyze_on: bool | None = None,
          ocr_provider_text: str | None = None, ocr_model_text: str | None = None,
-         ocr_key_text: str | None = None, target_app_text: str | None = None) -> None:
+         ocr_key_text: str | None = None, target_app_text: str | None = None,
+         cloud_mode_on: bool | None = None, cloud_server_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -236,13 +283,22 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
     flag = lambda new, now: now() if new is None else bool(new)
+    using_cloud = flag(cloud_mode_on, cloud_mode)
+    if using_cloud and style_text is not None:
+        from .cloud_runtime import current
+        db = current().require().db
+        uid = "00000000-0000-4000-8000-000000000001"
+        old = (db.visible("preferences", uid) or {}).get("payload", {})
+        db.save("preferences", uid, {**dict(tone="natural", length="short", count=3), **old, "style": str(style_text).strip()})
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
+        "connection_mode": "cloud" if using_cloud else "direct",
+        "cloud_server": cloud_server() if cloud_server_text is None else cloud_server_text,
         # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
         "relationship": relationship_text or relationship(), "context": n,
         "target_app": target_app_text if target_app_text in profiles.TARGET_APPS else target_app(),
-        "style": keep(style_text, "style"),
+        "style": keep(None if using_cloud else style_text, "style"),
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),

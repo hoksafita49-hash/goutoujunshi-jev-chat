@@ -68,6 +68,19 @@ class SettingsActivity : AppCompatActivity() {
 
         root.addView(header("设置"))
 
+        root.addView(card().apply {
+            addView(cardTitle("运行方式"))
+            addView(text("云模式：登录同一账号同步资料，模型密钥只保存在服务器。直连模式使用下方本机接口配置。", 12f, sub))
+            addView(pills(listOf("本机直连", "三端云账号"), if (prefs.cloudEnabled) 1 else 0) {
+                prefs.cloudEnabled = it == 1
+                recreate()
+            })
+            addView(cardBtn("云账号 · 登录 · 同步 · 导入与冲突") {
+                startActivity(android.content.Intent(this@SettingsActivity, CloudAccountActivity::class.java))
+            })
+            if (prefs.cloudEnabled) addView(text("当前云模式仅使用 ML Kit 本机 OCR；分析前仍需确认原文。云服务不可用时会保留队列并提示，不会调用本机旧 Key。", 12f, sub))
+        })
+
         // =================== 接口 ===================
         root.addView(section("接口"))
 
@@ -198,6 +211,7 @@ class SettingsActivity : AppCompatActivity() {
         jevFields.addView(judgeResult)
         strategyCard.addView(deepseekFields)
         strategyCard.addView(jevFields)
+        strategyCard.visibility = if (prefs.cloudEnabled) View.GONE else View.VISIBLE
         root.addView(strategyCard)
 
         // --- 回复接口 ---
@@ -256,6 +270,7 @@ class SettingsActivity : AppCompatActivity() {
             }
         })
         replyCard.addView(replyResult)
+        replyCard.visibility = if (prefs.cloudEnabled) View.GONE else View.VISIBLE
         root.addView(replyCard)
 
         // --- 视觉接口 ---
@@ -319,6 +334,7 @@ class SettingsActivity : AppCompatActivity() {
             }
         })
         visionCard.addView(visionResult)
+        visionCard.visibility = if (prefs.cloudEnabled) View.GONE else View.VISIBLE
         root.addView(visionCard)
 
         // =================== 分析 ===================
@@ -385,8 +401,13 @@ class SettingsActivity : AppCompatActivity() {
                 .setMessage("将删除 ${c.notes} 条笔记、${c.contacts} 个联系人、${c.logLines} 条聊天历史。" +
                     "密钥、白名单等设置不受影响。不可恢复。")
                 .setPositiveButton("清空") { _, _ ->
-                    KbStore.get(this).clearAll()
-                    kbResult.text = "已清空知识库与历史"
+                    if (prefs.cloudEnabled) {
+                        Toast.makeText(this, "云模式请在知识库逐项删除；待上传队列会保留", Toast.LENGTH_LONG).show()
+                        kbResult.text = "云模式请在知识库逐项删除"
+                    } else {
+                        KbStore.get(this).clearAll()
+                        kbResult.text = "已清空知识库与历史"
+                    }
                 }
                 .setNegativeButton("取消", null)
                 .show()

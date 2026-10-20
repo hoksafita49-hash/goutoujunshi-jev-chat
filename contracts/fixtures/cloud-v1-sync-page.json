@@ -1,0 +1,9 @@
+{
+  "server_epoch": "40000000-0000-4000-8000-000000000001",
+  "changes": [
+    {"seq": 1, "record": {"entity_type": "profiles", "uid": "50000000-0000-4000-8000-000000000001", "version": 1, "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:00:00Z", "deleted_at": null, "payload": {"name": "示例人物", "stage": "初识", "goal": "自然接话", "background": "", "notes": ""}}},
+    {"seq": 2, "record": {"entity_type": "notes", "uid": "60000000-0000-4000-8000-000000000001", "version": 2, "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:01:00Z", "deleted_at": "2026-10-21T00:01:00Z", "payload": {}}}
+  ],
+  "cursor": "opaque-test-cursor",
+  "has_more": false
+}

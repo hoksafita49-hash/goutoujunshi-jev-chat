@@ -34,6 +34,7 @@ capture_on = debug_on = None  # 采集开关/调试开关；由 spawn_worker 每
 results = queue.Queue()
 extras = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
+connection_identity = "direct"
 
 
 def chat_of(title, app=None):
@@ -178,7 +179,15 @@ def on_toggle_capture(on):
 def on_settings_saved():
     """Refresh the child so newly saved OCR credentials are read immediately.
     目标应用换过（微信 ↔ QQ）：旧窗口句柄和会话状态全部作废，重找窗口再重启采集。"""
-    global child
+    global child, connection_identity
+    identity = "direct"
+    if settings.cloud_mode() is True:
+        from app.cloud_runtime import current
+        identity = current().identity
+    if identity != connection_identity:
+        chats.clear()
+        ov.reset_chat_state()
+        connection_identity = identity
     active = capture_on is not None and capture_on.is_set()
     invalidate_capture()
     if settings.target_app() != state["app"]:
@@ -202,9 +211,23 @@ def on_settings_saved():
     ov.set_status("设置已保存；识图服务已重新载入", "success")
 
 
-def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=None):
+def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=None, account_identity=None, captured_app=None, source_messages=None, expected_context=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
     try:
+        if account_identity is not None and settings.cloud_mode() is not True:
+            raise RuntimeError("连接方式已变化，请重新核对；未调用本机模型")
+        if captured_app is not None and account_identity is None and settings.cloud_mode() is True:
+            raise RuntimeError("连接方式已变化，请重新核对后提交云端")
+        if settings.cloud_mode() is True:
+            from app.cloud_runtime import current
+            service = current()
+            identity = account_identity or service.identity
+            result = service.analyze(captured_app or state["app"], title, msgs, {"style": settings.style()},
+                                     expected_identity=identity, source_messages=source_messages, expected_context=expected_context)
+            result["cloud_identity"] = identity
+            result["reviewed_messages"] = msgs
+            results.put(("ok", result, title, revision, epoch))
+            return
         result = analyze(msgs, relationship, context=settings.context(),
                                    model=settings.draft_model() or None,
                                    provider=settings.draft_provider(),
@@ -234,8 +257,20 @@ def start_analyze(title, msgs):
         return
     state["reviewing"] = True
     epoch, app = state["epoch"], state["app"]
+    account_identity = None
+    if settings.cloud_mode() is True:
+        from app.cloud_runtime import current
+        account_identity = current().identity
     revision_of = lambda: chat_of(title, app)["rev"]
+    expected_context = None
     try:
+        if settings.cloud_mode() is True:
+            try:
+                service = current()
+                expected_context = service.require().conversation_for(app, title, service.source_device)
+            except (RuntimeError, ValueError) as exc:
+                ov.set_status(str(exc)[:220], "warning")
+                return
         dialog = ReviewDialog(title, msgs, ov.win,
                               history_of=lambda: list(chat_of(title, app)["history"]),
                               revision_of=revision_of)
@@ -246,20 +281,27 @@ def start_analyze(title, msgs):
                 or state["chat"] != title):
             ov.set_status("会话内容已变化，请重新核对后分析", "warning")
             return
+        original_rows = getattr(dialog, "_source_rows", None)
+        original_rows = list(original_rows) if isinstance(original_rows, (list, tuple)) else list(msgs)
         msgs = dialog.messages
     finally:
         state["reviewing"] = False
-    if not settings.has_strategy_key():
+    if settings.cloud_mode() is True:
+        from app.cloud_runtime import current
+        if not current().session or current().identity != account_identity:
+            ov.set_status("请先在设置中登录云账号；聊天草稿仍保存在当前账号本地缓存", "warning")
+            return
+    elif not settings.has_strategy_key():
         ov.set_status("请先在设置中配置模型", "warning")
         return
-    if not settings.has_llm_key():
+    if settings.cloud_mode() is not True and not settings.has_llm_key():
         ov.set_status(f"起草来源 {settings.draft_provider_name()} 没填密钥，去设置里补上", "warning")
         return
     state["busy"] = True
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, revision_of(), reply_to,
-                                             epoch, settings.profile_context(title)),
+                                             epoch, settings.profile_context(title), account_identity, app, original_rows, expected_context),
                      daemon=True).start()
 
 
@@ -274,6 +316,20 @@ def manual_analyze():
 
 def _extra_bg(kind, title, revision, result, index=None, epoch=None, relationship=None):
     try:
+        if result.get("cloud_identity") and settings.cloud_mode() is not True:
+            raise RuntimeError("连接方式已变化，请重新分析；未调用本机模型")
+        if settings.cloud_mode() is True:
+            from app.cloud_runtime import current
+            from app.gateway import result_for_ui
+            service = current()
+            if result.get("cloud_identity") != service.identity:
+                raise RuntimeError("账号已变化，请重新分析")
+            cloud = service.extra(result, kind, index)
+            payload = {"cloud_identity": service.identity, "value": cloud.get("text", ""),
+                       "context": {key: result[key] for key in ("cloud_identity", "profile_uid", "conversation_uid", "context_revision")},
+                       "mapped": result_for_ui(cloud) if kind == "rewrite" and cloud.get("candidates") else None}
+            extras.put(("cloud_" + kind, payload, title, revision, epoch))
+            return
         kwargs = dict(provider=settings.draft_provider(), model=settings.draft_model(),
                       key=settings.llm_key(), base_url=settings.draft_base_url() or None)
         messages = result["reviewed_messages"]
@@ -431,6 +487,19 @@ def tick():
                 continue
             if title != state["chat"] or title != ov.current_chat() or revision != chat_of(title)["rev"]:
                 continue
+            if kind.startswith("cloud_"):
+                from app.cloud_runtime import current
+                if not settings.cloud_mode() or not current().accept_result(payload["context"]):
+                    continue
+                if kind == "cloud_rewrite" and payload["mapped"]:
+                    result = chat_of(title)["result"]
+                    if result:
+                        updated = {**result, **payload["mapped"]}
+                        chat_of(title)["result"] = updated
+                        ov.show(updated)
+                else:
+                    ov.show_details(payload["value"] or "未返回解释内容", "云端详细分析")
+                continue
             if kind == "error":
                 ov.set_status("操作失败：" + payload, "warning")
             elif kind == "details":
@@ -460,6 +529,11 @@ def tick():
                 ov.set_busy(False)
                 continue
             if kind == "ok":
+                if r.get("cloud_identity"):
+                    from app.cloud_runtime import current
+                    if not settings.cloud_mode() or not current().accept_result(r):
+                        ov.set_busy(False)
+                        continue
                 chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
                 if title == ov.current_chat():
                     ov.show(r)
@@ -467,7 +541,8 @@ def tick():
                     ov.set_busy(False)
             else:
                 ov.set_busy(False)
-                ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
+                ov.set_status(str(r)[:220] if settings.cloud_mode() is True else
+                              "生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
                 ov.log(r)
     except Exception:
         traceback.print_exc()  # 一帧出错不退出
@@ -496,8 +571,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker(True)
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
-    if not settings.has_strategy_key():
-        ov.set_status("请先在设置中配置模型", "warning")
+    if not settings.has_key():
+        ov.set_status("请先在设置中登录云账号" if settings.cloud_mode() else "请先在设置中配置模型", "warning")
         ov.after(0, ov.open_settings)
     if settings.check_update() and update.parse_version(VERSION):  # 开发版没有版本号，不查也不烦源码用户
         threading.Thread(target=check_update_bg, daemon=True).start()

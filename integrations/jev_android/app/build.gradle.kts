@@ -17,6 +17,12 @@ val releaseProps = Properties().apply {
 }
 
 android {
+    buildFeatures { buildConfig = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { it.systemProperty("maven.repo.local", rootProject.file("work/robolectric-m2").absolutePath) }
+    }
+    sourceSets.getByName("test").resources.srcDir(rootProject.file("../../contracts/fixtures"))
     namespace = "com.jev.probe"
     compileSdk = 35
 
@@ -82,4 +88,6 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("androidx.test:core:1.6.1")
 }

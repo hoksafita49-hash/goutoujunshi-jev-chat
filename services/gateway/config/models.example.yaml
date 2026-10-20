@@ -1,0 +1,12 @@
+version: 1
+routes:
+  draft:
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-flash
+    api_key_env: DEEPSEEK_API_KEY
+    disable_thinking: true
+  strategy:
+    base_url: https://api.deepseek.com/v1
+    model: deepseek-flash
+    api_key_env: DEEPSEEK_API_KEY
+    disable_thinking: true

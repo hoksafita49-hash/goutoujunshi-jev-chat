@@ -62,6 +62,15 @@ final class GoutouStore {
     }
 
     func config() -> AppConfig { decode("config", fallback: AppConfig()) }
+    var cloudEnabled: Bool {
+        get { defaults.bool(forKey: "cloudEnabled") }
+        set { defaults.set(newValue, forKey: "cloudEnabled"); clearHandoff(); captureMailbox.clear(); clearKeyboardSession() }
+    }
+    var cloudServer: String {
+        get { defaults.string(forKey: "cloudServer") ?? "https://api.zovoeh.cn" }
+        set { defaults.set(newValue, forKey: "cloudServer") }
+    }
+    var cloudDirectory: URL { container.appendingPathComponent("cloud", isDirectory: true) }
     func saveConfig(_ value: AppConfig) throws {
         try value.validate()
         try save(value, key: "config")

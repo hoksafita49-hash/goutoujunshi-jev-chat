@@ -19,6 +19,8 @@ import androidx.appcompat.app.AppCompatActivity
 import com.jev.probe.core.kb.Contact
 import com.jev.probe.core.kb.KbStore
 import com.jev.probe.core.kb.Note
+import com.jev.probe.core.Prefs
+import com.jev.probe.cloud.SessionStore
 import kotlin.math.roundToInt
 
 /**
@@ -33,6 +35,9 @@ class KnowledgeActivity : AppCompatActivity() {
 
     private lateinit var store: KbStore
     private lateinit var container: LinearLayout
+    private var viewAccount = ""
+    private fun accountIdentity(): String = if (Prefs(this).cloudEnabled)
+        "cloud:" + (SessionStore(this).load()?.accountKey ?: "signed-out") else "local"
 
     /** 0 = notes, 1 = contacts. */
     private var tab = 0
@@ -49,6 +54,7 @@ class KnowledgeActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = KbStore.get(this)
+        viewAccount = accountIdentity()
         window.decorView.setBackgroundColor(Color.parseColor("#F2F3F5"))
 
         val scroll = ScrollView(this)
@@ -62,12 +68,17 @@ class KnowledgeActivity : AppCompatActivity() {
         render()
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (viewAccount != accountIdentity()) recreate() else if (::container.isInitialized) render()
+    }
+
     // --------------------------------------------------------------- screens
 
     private fun render() {
         container.removeAllViews()
         container.addView(text("知识库与联系人", 24f, ink, bold = true))
-        container.addView(text("只存在本机，不上传。分析时按会话标题匹配联系人、按关键词命中笔记。",
+        container.addView(text(if (Prefs(this).cloudEnabled) "当前云账号的资料与确认历史会同步。人物需明确关联，不能按同名自动合并。" else "只存在本机，不上传。分析时按会话标题匹配联系人、按关键词命中笔记。",
             12f, sub).apply { setPadding(0, dp(6), 0, dp(4)) })
         container.addView(tabs())
         if (tab == 0) renderNotes() else renderContacts()

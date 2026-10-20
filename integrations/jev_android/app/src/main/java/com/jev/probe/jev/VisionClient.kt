@@ -38,6 +38,7 @@ class VisionClient(private val prefs: Prefs) {
 
     /** Generic single-question call against the image (used by the settings test). */
     fun ask(imageBase64Jpeg: String, prompt: String): String {
+        check(!prefs.cloudEnabled) { "云模式本阶段仅支持本机 OCR，请使用 ML Kit" }
         val url = prefs.visionEndpoint()
         val image = JSONObject().put("type", "image_url")
             .put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$imageBase64Jpeg"))

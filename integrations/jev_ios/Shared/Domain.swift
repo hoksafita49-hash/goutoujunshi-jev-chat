@@ -110,7 +110,8 @@ struct Candidate: Codable, Equatable, Identifiable {
     var reason: String
     var tradeoff: String
     var weight: Int?
-    var id: String { text }
+    var stableId: String? = nil
+    var id: String { stableId ?? text }
 }
 
 struct Evidence: Codable, Equatable {

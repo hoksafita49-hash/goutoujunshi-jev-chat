@@ -8,9 +8,20 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-project = json.loads(subprocess.check_output([
-    "plutil", "-convert", "json", "-o", "-", str(ROOT / "GoutouJunshi.xcodeproj/project.pbxproj")
-]))
+try:
+    project = json.loads(subprocess.check_output([
+        "plutil", "-convert", "json", "-o", "-", str(ROOT / "GoutouJunshi.xcodeproj/project.pbxproj")
+    ]))
+except FileNotFoundError:
+    # The generator is deterministic. Windows can inspect its object graph and
+    # compare the checked-in project byte-for-byte without an Apple toolchain.
+    source = (ROOT / "tools/generate_project.py").read_text(encoding="utf-8")
+    generated = {"__file__": str(ROOT / "tools/generate_project.py")}
+    exec(compile(source[:source.index('directory = ROOT / "GoutouJunshi.xcodeproj"')], "generate_project.py", "exec"), generated)
+    expected = "// !$*UTF8*$!\n" + generated["serial"]({"archiveVersion": 1, "classes": {}, "objectVersion": 56,
+        "objects": generated["objects"], "rootObject": generated["project_id"]}) + "\n"
+    assert (ROOT / "GoutouJunshi.xcodeproj/project.pbxproj").read_text(encoding="utf-8") == expected, "Regenerate Xcode project"
+    project = {"objects": generated["objects"]}
 objects = project["objects"]
 targets = {value["name"]: value for value in objects.values() if value["isa"] == "PBXNativeTarget"}
 assert set(targets) == {"GoutouJunshi", "GoutouKeyboard", "GoutouCapture"}
@@ -26,6 +37,8 @@ def phase_paths(target, phase):
 for name, folder in [("GoutouJunshi", "App"), ("GoutouKeyboard", "Keyboard"), ("GoutouCapture", "Capture")]:
     target = targets[name]
     sources = {p.relative_to(ROOT).as_posix() for p in (ROOT / folder / "Sources").glob("*.swift")}
+    if name == "GoutouJunshi":
+        sources |= {p.relative_to(ROOT).as_posix() for p in (ROOT / "App/Sync").glob("*.swift")}
     if name == "GoutouKeyboard":
         sources |= {p.relative_to(ROOT).as_posix() for p in (ROOT / "Keyboard/Input").glob("*.swift")}
     common = {"Shared/Domain.swift", "Shared/Store.swift", "Shared/CaptureMailbox.swift"} if name == "GoutouCapture" else shared
@@ -45,6 +58,8 @@ for name, folder in [("GoutouJunshi", "App"), ("GoutouKeyboard", "Keyboard"), ("
             assert settings["APPLICATION_EXTENSION_API_ONLY"] == "YES"
         if name == "GoutouCapture":
             assert "GOUTOU_CAPTURE" in settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"].split()
+        if name == "GoutouJunshi":
+            assert "-lsqlite3" in settings["OTHER_LDFLAGS"]
 
 assert phase_paths(targets["GoutouJunshi"], "PBXCopyFilesBuildPhase") == {"GoutouKeyboard.appex", "GoutouCapture.appex"}
 assert len(targets["GoutouJunshi"]["dependencies"]) == 2
@@ -58,7 +73,7 @@ assert entitlements[0] == entitlements[1] == {
 }
 for file in ("App/Info.plist", "Keyboard/Info.plist"):
     info = plistlib.loads((ROOT / file).read_bytes())
-    assert "NSAppTransportSecurity" not in info
+    assert info["NSAppTransportSecurity"] == {"NSAllowsLocalNetworking": True}
     assert info["GoutouAppGroup"] == "$(GOUTOU_APP_GROUP)"
     assert info["GoutouKeychainGroup"] == "$(GOUTOU_KEYCHAIN_GROUP)"
 keyboard = plistlib.loads((ROOT / "Keyboard/Info.plist").read_bytes())["NSExtension"]
@@ -70,7 +85,7 @@ assert keyboard["NSExtensionPrincipalClass"] == "$(PRODUCT_MODULE_NAME).Keyboard
 # A build-11 device crash hit _UIApplicationAssertForExtensionType from
 # UIAlertController initialization in confirmInsert(). Keep dialogs in-view.
 for source in (ROOT / "Keyboard/Sources").glob("*.swift"):
-    assert "UIAlertController" not in source.read_text(), "System alert disallowed in keyboard: " + str(source)
+    assert "UIAlertController" not in source.read_text(encoding="utf-8"), "System alert disallowed in keyboard: " + str(source)
 capture = plistlib.loads((ROOT / "Capture/Info.plist").read_bytes())["NSExtension"]
 assert capture["NSExtensionPointIdentifier"] == "com.apple.broadcast-services-upload"
 assert capture["NSExtensionAttributes"]["RPBroadcastProcessMode"] == "RPBroadcastProcessModeSampleBuffer"
@@ -79,12 +94,14 @@ assert plistlib.loads((ROOT / "Capture/GoutouCapture.entitlements").read_bytes()
     "com.apple.security.application-groups": ["$(GOUTOU_APP_GROUP)"]
 }
 assert "Shared/Networking.swift" not in phase_paths(targets["GoutouCapture"], "PBXSourcesBuildPhase")
+for name in ("GoutouKeyboard", "GoutouCapture"):
+    assert not any(path.startswith("App/Sync/") for path in phase_paths(targets[name], "PBXSourcesBuildPhase")), "Only main app may open sync SQLite"
 assert {"Keyboard/Resources/pinyin.tsv", "Keyboard/Resources/Pinyin-LICENSE.txt"} <= phase_paths(targets["GoutouKeyboard"], "PBXResourcesBuildPhase")
 scheme = ET.parse(ROOT / "GoutouJunshi.xcodeproj/xcshareddata/xcschemes/GoutouJunshi.xcscheme")
 for item in scheme.findall(".//BuildableReference"):
     assert objects[item.attrib["BlueprintIdentifier"]]["name"] == "GoutouJunshi"
 icons = ROOT / "App/Assets.xcassets/AppIcon.appiconset"
-for item in json.loads((icons / "Contents.json").read_text())["images"]:
+for item in json.loads((icons / "Contents.json").read_text(encoding="utf-8"))["images"]:
     png = (icons / item["filename"]).read_bytes()
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     width, height, _, color = struct.unpack(">IIBB", png[16:26])
@@ -93,7 +110,7 @@ for item in json.loads((icons / "Contents.json").read_text())["images"]:
 manifest = plistlib.loads((ROOT / "PrivacyInfo.xcprivacy").read_bytes())
 assert manifest["NSPrivacyTracking"] is False
 assert manifest["NSPrivacyAccessedAPITypes"][0]["NSPrivacyAccessedAPITypeReasons"] == ["1C8F.1"]
-provenance = json.loads((ROOT / "vendor/UPSTREAM.json").read_text())
+provenance = json.loads((ROOT / "vendor/UPSTREAM.json").read_text(encoding="utf-8"))
 assert len(provenance["commit"]) == 40 and len(provenance["archive_sha256"]) == 64
 assert (ROOT / "vendor/LICENSE").is_file() and (ROOT / "vendor/NOTICE").is_file()
 assert not list(ROOT.rglob("*.ipa")), "Unsigned source preview must not masquerade as an IPA"

@@ -94,7 +94,7 @@ class MainActivity : AppCompatActivity() {
 
         // Actions
         container.addView(sectionLabel("其他"))
-        container.addView(actionRow("设置", "密钥 · 模型 · 关系 · 透明度 · 会话白名单") {
+        container.addView(actionRow("设置", "云账号与同步 · 本机接口 · 关系 · 透明度 · 会话白名单") {
             startActivity(Intent(this, SettingsActivity::class.java))
         })
 
@@ -119,7 +119,8 @@ class MainActivity : AppCompatActivity() {
         c.addView(head)
         c.addView(checkLine("无障碍", a11y))
         c.addView(checkLine("悬浮窗", overlay))
-        c.addView(checkLine("密钥", key, okWord = "已设", noWord = "未设"))
+        c.addView(checkLine(if (prefs.cloudEnabled) "云账号" else "密钥", key,
+            okWord = if (prefs.cloudEnabled) "已登录" else "已设", noWord = if (prefs.cloudEnabled) "需登录" else "未设"))
         // History recording is opt-in (off by default). Mention it here, never block on it.
         if (!prefs.contextEnabled) {
             c.addView(text("关联上下文未开启，可在设置里开启", 12f, sub).apply {
@@ -130,7 +131,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** One tappable line under the readiness card, opening the privacy policy page. */
-    private fun privacyHint(): View = text("读取的聊天内容只发往你自己配置的接口 · 隐私政策", 11f, sub).apply {
+    private fun privacyHint(): View = text(if (prefs.cloudEnabled) "确认的文字与资料将经网关同步；截图在本机 OCR · 隐私政策" else "读取的聊天内容只发往你自己配置的接口 · 隐私政策", 11f, sub).apply {
         setPadding(dp(2), dp(8), 0, 0)
         setOnClickListener { openUrl(PRIVACY_URL) }
     }

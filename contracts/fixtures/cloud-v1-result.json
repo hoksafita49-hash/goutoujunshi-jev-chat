@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "analysis_id": "10000000-0000-4000-8000-000000000001",
+  "conversation_uid": "20000000-0000-4000-8000-000000000001",
+  "context_revision": 3,
+  "facts": ["对方说今天有点忙"],
+  "hypotheses": ["可能暂时没有空回复"],
+  "unknowns": ["是否希望稍后继续聊天"],
+  "strategy": "降压",
+  "stop_condition": "对方明确要求停止联系时停止推进",
+  "candidates": [
+    {"candidate_id": "30000000-0000-4000-8000-000000000002", "text": "那你先忙", "reason": null, "weight": null},
+    {"candidate_id": "30000000-0000-4000-8000-000000000001", "text": "有空再聊", "reason": null, "weight": null}
+  ],
+  "ranking_status": "unavailable",
+  "usage": {},
+  "pipeline_version": "cloud-v1",
+  "future_optional_field": "clients ignore unknown response fields"
+}

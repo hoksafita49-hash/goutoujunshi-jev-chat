@@ -5,6 +5,10 @@ import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import com.jev.probe.core.Prefs
+import com.jev.probe.cloud.SessionStore
+import com.jev.probe.cloud.CloudRuntime
+import com.jev.probe.data.ContactRepository
 
 /** Note / contact / history counts, for the settings screen. */
 data class KbCounts(val notes: Int, val contacts: Int, val logLines: Int)
@@ -25,6 +29,9 @@ class KbStore private constructor(context: Context) {
 
     private val app = context.applicationContext
     private val lock = Any()
+    private val cloud: Boolean get() = Prefs(app).cloudEnabled
+    private fun repository(): ContactRepository? = SessionStore(app).load()?.let { ContactRepository(app, it) }
+    private fun changed() { CloudRuntime.schedule(app) }
 
     private val root: File get() = File(app.filesDir, "kb")
     private val notesFile: File get() = File(root, "notes.json")
@@ -41,12 +48,13 @@ class KbStore private constructor(context: Context) {
 
     // ------------------------------------------------------------------ notes
 
-    fun notes(): List<Note> = synchronized(lock) { loadNotes().toList() }
+    fun notes(): List<Note> = if (cloud) repository()?.notes() ?: emptyList() else synchronized(lock) { loadNotes().toList() }
 
-    fun note(id: String): Note? = synchronized(lock) { loadNotes().firstOrNull { it.id == id } }
+    fun note(id: String): Note? = if (cloud) repository()?.notes()?.firstOrNull { it.id == id } else synchronized(lock) { loadNotes().firstOrNull { it.id == id } }
 
     /** Insert or replace by id. Returns false when it did not reach disk. */
     fun saveNote(note: Note): Boolean = synchronized(lock) {
+        if (cloud) return@synchronized repository()?.saveNote(note)?.also { changed() } ?: false
         val list = loadNotes()
         val i = list.indexOfFirst { it.id == note.id }
         val stamped = note.copy(updatedAt = System.currentTimeMillis())
@@ -57,6 +65,7 @@ class KbStore private constructor(context: Context) {
     }
 
     fun deleteNote(id: String): Boolean = synchronized(lock) {
+        if (cloud) return@synchronized repository()?.deleteNote(id)?.also { changed() } ?: false
         val list = loadNotes()
         if (!list.removeAll { it.id == id }) return@synchronized true
         val ok = writeAtomic(notesFile, notesJson(list))
@@ -66,11 +75,12 @@ class KbStore private constructor(context: Context) {
 
     // --------------------------------------------------------------- contacts
 
-    fun contacts(): List<Contact> = synchronized(lock) { loadContacts().toList() }
+    fun contacts(): List<Contact> = if (cloud) repository()?.contacts() ?: emptyList() else synchronized(lock) { loadContacts().toList() }
 
-    fun contact(id: String): Contact? = synchronized(lock) { loadContacts().firstOrNull { it.id == id } }
+    fun contact(id: String): Contact? = if (cloud) repository()?.contact(id) else synchronized(lock) { loadContacts().firstOrNull { it.id == id } }
 
     fun saveContact(c: Contact): Boolean = synchronized(lock) {
+        if (cloud) return@synchronized repository()?.saveContact(c)?.also { changed() } ?: false
         val list = loadContacts()
         val i = list.indexOfFirst { it.id == c.id }
         val stamped = c.copy(updatedAt = System.currentTimeMillis())
@@ -82,6 +92,7 @@ class KbStore private constructor(context: Context) {
 
     /** Removes the contact and its history file. */
     fun deleteContact(id: String): Boolean = synchronized(lock) {
+        if (cloud) return@synchronized repository()?.deleteContact(id)?.also { changed() } ?: false
         val list = loadContacts()
         var ok = true
         if (list.removeAll { it.id == id }) {
@@ -104,6 +115,7 @@ class KbStore private constructor(context: Context) {
      *        prefer a contact that already knows this app when two match.
      */
     fun findContact(title: String, app: String): Contact? {
+        if (cloud) return repository()?.findContact(title, app)
         synchronized(lock) {
             val want = normalizeName(title)
             if (want.isEmpty()) return null
@@ -120,6 +132,7 @@ class KbStore private constructor(context: Context) {
      * one that already matches. Returns a message for the toast.
      */
     fun saveOrMergeContact(title: String, app: String): String {
+        if (cloud) return repository()?.saveOrMergeContact(title, app)?.also { changed() } ?: "请先登录云账号"
         val display = displayName(title)
         if (display.isEmpty()) return "当前会话没有标题，存不了"
         val existing = findContact(title, app)
@@ -170,6 +183,8 @@ class KbStore private constructor(context: Context) {
      *        is appended as-is.
      */
     fun appendLog(contactId: String, entries: List<LogEntry>, screenBatch: Boolean = true): Boolean {
+        // Cloud confirmed messages are recorded with their conversation UID by CloudAnalysis only.
+        if (cloud) return false
         if (entries.isEmpty()) return true
         synchronized(lock) {
             val screen = entries.filter { it.text.isNotBlank() }
@@ -222,6 +237,7 @@ class KbStore private constructor(context: Context) {
 
     /** The newest [n] entries, oldest first. */
     fun recentLog(contactId: String, n: Int): List<LogEntry> {
+        if (cloud) return repository()?.logs(contactId)?.takeLast(n.coerceAtLeast(0)) ?: emptyList()
         if (n <= 0) return emptyList()
         synchronized(lock) {
             val list = loadLog(contactId)
@@ -230,9 +246,10 @@ class KbStore private constructor(context: Context) {
         }
     }
 
-    fun logSize(contactId: String): Int = synchronized(lock) { loadLog(contactId).size }
+    fun logSize(contactId: String): Int = if (cloud) repository()?.logs(contactId)?.size ?: 0 else synchronized(lock) { loadLog(contactId).size }
 
     fun clearLog(contactId: String) = synchronized(lock) {
+        if (cloud) { repository()?.clearLog(contactId); changed(); return@synchronized }
         logCache.remove(contactId)
         lastScreenCache.remove(contactId)
         runCatching { logFile(contactId).delete() }
@@ -269,6 +286,7 @@ class KbStore private constructor(context: Context) {
     // ------------------------------------------------------------------ admin
 
     fun counts(): KbCounts = synchronized(lock) {
+        if (cloud) return@synchronized KbCounts(notes().size, contacts().size, contacts().sumOf { logSize(it.id) })
         val contacts = loadContacts()
         var lines = 0
         contacts.forEach { lines += loadLog(it.id).size }
@@ -280,6 +298,7 @@ class KbStore private constructor(context: Context) {
      * whitelist and every other SharedPreferences value are untouched.
      */
     fun clearAll() = synchronized(lock) {
+        if (cloud) { return@synchronized } // Cloud deletion must be explicit per object; never wipe an account queue.
         notesCache = null
         contactsCache = null
         logCache.clear()
@@ -485,7 +504,7 @@ class KbStore private constructor(context: Context) {
                 instance ?: KbStore(context).also { instance = it }
             }
 
-        fun newId(): String = java.util.UUID.randomUUID().toString().substring(0, 12)
+        fun newId(): String = java.util.UUID.randomUUID().toString()
 
         /**
          * Compile a pattern without ever taking the class down with it. A

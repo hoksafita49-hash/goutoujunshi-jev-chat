@@ -14,31 +14,33 @@ import com.jev.probe.core.kb.ChatContext
  */
 class JevClient(private val prefs: Prefs) {
 
+    private fun directOnly() { check(!prefs.cloudEnabled) { "云模式必须通过网关分析任务；请先登录并核对当前对话" } }
+
     private val judgeClient = JudgeClient(prefs)
     private val replyClient = ReplyClient(prefs)
     private val deepSeekStrategy = DeepSeekStrategyClient(prefs)
 
     fun details(snapshot: ChatSnapshot, relationship: String, judgment: Analysis, ctx: ChatContext? = null): String =
-        replyClient.details(snapshot, relationship, judgment, ctx)
+        run { directOnly(); replyClient.details(snapshot, relationship, judgment, ctx) }
 
     fun explain(snapshot: ChatSnapshot, relationship: String, judgment: Analysis, candidate: String, ctx: ChatContext? = null): String =
-        replyClient.explain(snapshot, relationship, judgment, candidate, ctx)
+        run { directOnly(); replyClient.explain(snapshot, relationship, judgment, candidate, ctx) }
 
     fun rewrite(snapshot: ChatSnapshot, judgment: Analysis, candidates: List<String>): List<String> =
-        replyClient.rewrite(snapshot, judgment, candidates)
+        run { directOnly(); replyClient.rewrite(snapshot, judgment, candidates) }
 
     fun rerank(snapshot: ChatSnapshot, relationship: String, judgment: Analysis,
-               candidates: List<String>, ctx: ChatContext? = null): List<RankedReply> = try {
+               candidates: List<String>, ctx: ChatContext? = null): List<RankedReply> = run { directOnly(); try {
         if (prefs.strategyProvider == "deepseek")
             deepSeekStrategy.rank(snapshot, relationship, judgment.strategy ?: "澄清", candidates, ctx)
         else judgeClient.rank(snapshot, relationship, candidates, ctx)
-    } catch (_: Exception) { candidates.map { RankedReply(it, 0.0) } }
+    } catch (_: Exception) { candidates.map { RankedReply(it, null) } } }
 
     /** The 7 judgment questions. Errors come back inside [Analysis.error]. */
     fun judge(snapshot: ChatSnapshot, relationship: String, ctx: ChatContext? = null): Analysis =
-        if (GoutouGuidance.explicitBoundary(snapshot)) GoutouGuidance.boundaryAnalysis()
+        run { directOnly(); if (GoutouGuidance.explicitBoundary(snapshot)) GoutouGuidance.boundaryAnalysis()
         else if (prefs.strategyProvider == "deepseek") deepSeekStrategy.judge(snapshot, relationship, ctx)
-        else judgeClient.judge(snapshot, relationship, ctx)
+        else judgeClient.judge(snapshot, relationship, ctx) }
 
     /** Draft 3 candidates on the reply route, then rank them on the judge route. */
     fun draftAndRank(
@@ -47,6 +49,7 @@ class JevClient(private val prefs: Prefs) {
         ctx: ChatContext? = null,
         judgment: Analysis? = null
     ): List<RankedReply> {
+        directOnly()
         val candidates = replyClient.draft(snapshot, relationship, ctx, judgment)
         if (candidates.isEmpty()) return emptyList()
         // A ranking outage must not discard drafts that were already generated.
@@ -56,7 +59,7 @@ class JevClient(private val prefs: Prefs) {
                 deepSeekStrategy.rank(snapshot, relationship, judgment?.strategy ?: "澄清", candidates, ctx)
             else judgeClient.rank(snapshot, relationship, candidates, ctx)
         }
-        catch (_: Exception) { candidates.map { RankedReply(it, 0.0) } }
+        catch (_: Exception) { candidates.map { RankedReply(it, null) } }
     }
 
     /** Judge + replies, sequential. Used by the settings connectivity test. */

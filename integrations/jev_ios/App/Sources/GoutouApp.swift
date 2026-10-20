@@ -24,11 +24,11 @@ struct GoutouApp: App {
             .foregroundStyle(Palette.ink)
             .toolbarBackground(Palette.cream, for: .tabBar)
             .environmentObject(model)
-            .onAppear { receiveScreenshot() }
+            .onAppear { receiveScreenshot(); model.foreground() }
             .onChange(of: screenshotInbox.pending) { _ in receiveScreenshot() }
             .onChange(of: scenePhase) { phase in
-                if phase == .active { model.reload() }
-                else if phase == .background { model.cancel() }
+                if phase == .active { model.foreground() }
+                else if phase == .background { model.background() }
             }
         }
     }
@@ -59,7 +59,7 @@ final class AppModel: ObservableObject {
     @Published var config = AppConfig()
     @Published var relationship = Relationship(id: "current")
     @Published var transcript = "" {
-        didSet { if oldValue != transcript { confirmed = false; invalidate(clear: true) } }
+        didSet { if oldValue != transcript { confirmed = false; cloudContext = nil; invalidate(clear: true) } }
     }
     @Published var confirmed = false
     @Published var source = "手动输入"
@@ -69,17 +69,42 @@ final class AppModel: ObservableObject {
     @Published var keyboardStatus = ""
     @Published var demo = false
     @Published var shortcutScreenshot: Data?
+    @Published var cloudEnabled = false
+    @Published var cloudStatus = "需登录"
+    @Published var cloudEmail = ""
+    @Published var cloudBusy = false
+    @Published var cloudProfiles = [Relationship]()
+    @Published var cloudContexts = [CloudContext]()
+    @Published var cloudConflicts = [CloudConflict]()
+    @Published var cloudPendingJobs = [CloudPendingJob]()
+    @Published var cloudRecovery = false
+    @Published var cloudContext: CloudContext?
+    @Published var cloudExplanation = ""
     let transport = HTTPTransport()
     var store: GoutouStore?
-    private var task: Task<Void, Never>?
-    private var revision = 0
+    var cloud: SyncCoordinator?
+    var cloudLoop: Task<Void, Never>?
+    var cloudManualTask: Task<Void, Never>?
+    var task: Task<Void, Never>?
+    var revision = 0
 
     init() {
-        do { store = try GoutouStore(); reload() }
+        do {
+            store = try GoutouStore()
+            cloud = SyncCoordinator(directory: store!.cloudDirectory)
+            try cloud?.restore(); reload()
+        }
         catch { status = error.localizedDescription }
     }
     func reload() {
         guard let store = store else { return }
+        cloudEnabled = store.cloudEnabled
+        if cloudEnabled {
+            config = AppConfig(); config.ocr = .local
+            keyboardStatus = store.keyboardStatus
+            refreshCloudView()
+            return
+        }
         let updated = store.config(), context = store.relationship()
         store.purgeExpiredHandoff()
         if updated != config || context != relationship {
@@ -99,6 +124,7 @@ final class AppModel: ObservableObject {
     func api() throws -> ModelAPI { ModelAPI(transport: transport, config: config, secrets: try CredentialVault.load()) }
 
     func analyze(rewrite: Bool = false) {
+        if cloudEnabled { analyzeCloud(kind: rewrite ? "rewrite" : "analysis"); return }
         guard !working else { return }
         let original = advice
         do {
@@ -141,6 +167,11 @@ final class AppModel: ObservableObject {
         status = "离线示例 · 未读取聊天、未调用接口；数字仅用于展示。"
     }
     func sendToKeyboard() {
+        if cloudEnabled {
+            do { try cloud?.publish(); status = "已更新键盘只读缓存；需完全访问，切换键盘后核对当前对象。" }
+            catch { status = error.localizedDescription }
+            return
+        }
         guard let store = store, let advice = advice, confirmed, !demo, !working else { return }
         do {
             try store.handoff(KeyboardHandoff(transcript: transcript, advice: advice, relationship: relationship,
@@ -149,6 +180,7 @@ final class AppModel: ObservableObject {
         } catch { status = error.localizedDescription }
     }
     func recognize(_ data: Data, provider: OCRProvider) {
+        if cloudEnabled { performRecognition(data, provider: .local, sourceLabel: "Apple Vision · 本地"); return }
         guard provider == config.ocr else { status = "识图配置已变化，请重新选择截图并确认。"; return }
         performRecognition(data, provider: provider, sourceLabel: provider.rawValue)
     }

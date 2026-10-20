@@ -37,7 +37,8 @@ def build(target, path, filetype="sourcecode.swift"):
 
 shared = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Shared").glob("*.swift"))
 recognition = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "ImageRecognition").glob("*.swift"))
-app = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "App/Sources").glob("*.swift"))
+app = sorted(p.relative_to(ROOT).as_posix() for folder in ("App/Sources", "App/Sync")
+             for p in (ROOT / folder).glob("*.swift"))
 keyboard = sorted(p.relative_to(ROOT).as_posix() for folder in ("Keyboard/Sources", "Keyboard/Input")
                   for p in (ROOT / folder).glob("*.swift"))
 capture = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "Capture/Sources").glob("*.swift"))
@@ -122,6 +123,7 @@ for name, files, product, kind, identifier, info, entitlement in [
             settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "GOUTOU_CAPTURE"
     else:
         settings["ASSETCATALOG_COMPILER_APPICON_NAME"] = "AppIcon"
+        settings["OTHER_LDFLAGS"] = ["$(inherited)", "-lsqlite3"]
     objects[target_key] = {"isa": "PBXNativeTarget", "name": name, "productName": name, "productType": kind,
                           "productReference": product_ref, "buildConfigurationList": configurations(name, settings),
                           "buildPhases": phases, "buildRules": [], "dependencies": dependencies}
@@ -177,8 +179,10 @@ base_info = {
 }
 for path, info in [
     ("App/Info.plist", {**base_info, "CFBundleDisplayName": "狗头军师", "CFBundlePackageType": "APPL",
+                        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
                         "LSRequiresIPhoneOS": True, "UILaunchScreen": {}, "UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait"]}),
     ("Keyboard/Info.plist", {**base_info, "CFBundleDisplayName": "狗头军师", "CFBundlePackageType": "XPC!",
+        "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         "NSExtension": {"NSExtensionPointIdentifier": "com.apple.keyboard-service",
                        "NSExtensionPrincipalClass": "$(PRODUCT_MODULE_NAME).KeyboardViewController",
                        "NSExtensionAttributes": {"IsASCIICapable": True, "PrefersRightToLeft": False,

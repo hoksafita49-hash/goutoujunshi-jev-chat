@@ -11,6 +11,8 @@ hiddenimports = [
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
     "app.worker", "app.capture", "app.ocr", "app.cloud_ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin", "app.trend_ui", "app.review",  # lazy windows
+    "app.gateway", "app.auth_store", "app.local_db", "app.repositories", "app.sync_worker",
+    "app.legacy_import", "app.cloud_runtime", "app.cloud_ui", "sqlite3", "ctypes.wintypes",
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm", "core.deepseek_strategy", "core.trend", "core.experience",
 ]

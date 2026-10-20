@@ -19,6 +19,19 @@ struct ConversationView: View {
         ScrollViewReader { proxy in
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                if model.cloudEnabled {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("云端已确认聊天").font(.headline)
+                        Text(model.cloudStatus).font(.caption)
+                        ForEach(model.cloudContexts.filter { $0.profileUid == model.relationship.id }) { context in
+                            Button { model.openCloudContext(context) } label: {
+                                Text(String(context.transcript.prefix(80)) + (context.result == nil ? " · 已同步" : " · 含分析结果"))
+                                    .font(.caption).lineLimit(3)
+                            }
+                        }
+                        Button("立即同步") { model.syncCloud() }
+                    }.card()
+                }
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 12) {
                         ShibaBadge()
@@ -79,6 +92,9 @@ struct ConversationView: View {
                         .accessibilityIdentifier("transcriptEditor")
                     Toggle("已核对原文、双方身份与当前对象", isOn: $model.confirmed)
                         .font(.callout).disabled(model.working)
+                    if model.cloudEnabled {
+                        Button("仅同步已确认聊天") { model.syncConfirmedChat() }.disabled(!model.confirmed || model.working)
+                    }
                     if model.working {
                         HStack { ProgressView(); Button("取消") { model.cancel() } }
                     } else {
@@ -95,6 +111,10 @@ struct ConversationView: View {
                         Spacer()
                         Button("详细分析") { details = true }.accessibilityIdentifier("detailsButton")
                     }.buttonStyle(.bordered)
+                    if model.cloudEnabled {
+                        Button("请求云端详细解释") { model.analyzeCloud(kind: "explanation") }.disabled(model.working || model.demo)
+                        if !model.cloudExplanation.isEmpty { Text(model.cloudExplanation).textSelection(.enabled).card() }
+                    }
                     Button("把本轮结果交给键盘") { model.sendToKeyboard() }
                         .buttonStyle(BrandPrimaryButtonStyle()).disabled(!model.confirmed || model.demo || model.working || model.store == nil)
                     Text("主动交接在本机暂存 5 分钟，交接文件取用后删除。键盘最近一轮另暂存 5 分钟，收起后可恢复；可在键盘或配置页立即清除。")

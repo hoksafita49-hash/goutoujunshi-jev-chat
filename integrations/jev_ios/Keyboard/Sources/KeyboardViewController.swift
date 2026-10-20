@@ -36,6 +36,9 @@ final class KeyboardViewController: UIInputViewController {
     private var persistedSession: KeyboardSession?
     private var draftInsertion = DraftInsertion()
     private var expandedReasons = Set<Int>()
+    private var cloudSnapshot: CloudSnapshot?
+    private var cloudContext: CloudContext?
+    private var cloudAccountKey: String?
     private lazy var typingView: TypingKeyboardView = {
         let keyboard = TypingKeyboardView()
         keyboard.onInsert = { [weak self] text in self?.textDocumentProxy.insertText(text) }
@@ -105,6 +108,10 @@ final class KeyboardViewController: UIInputViewController {
             config = store!.config(); relationship = store!.relationship()
             documentID = textDocumentProxy.documentIdentifier
             store?.setKeyboardStatus(fullAccess: true)
+            if store?.cloudEnabled == true {
+                try loadCloudCache()
+                render(); return
+            }
             if let handoff = store?.takeHandoff() {
                 transcript = handoff.transcript; advice = handoff.advice; confirmed = false
                 mode = .result
@@ -133,7 +140,7 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
     private func receiveCapture() {
-        guard isKeyboardVisible, hasFullAccess, mode != .loading, mode != .insertConfirmation,
+        guard isKeyboardVisible, hasFullAccess, store?.cloudEnabled != true, mode != .loading, mode != .insertConfirmation,
               let store = store else { return }
         guard let result = store.captureMailbox.peek(relationship: store.relationship(), config: store.config()) else {
             if receivedCaptureID != nil, mode == .screenshot, pendingScreenshot != nil {
@@ -227,7 +234,7 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
     private func persistSession() {
-        guard hasFullAccess, let store = store, !transcript.trimmed.isEmpty,
+        guard hasFullAccess, let store = store, !store.cloudEnabled, !transcript.trimmed.isEmpty,
               store.config() == config, store.relationship() == relationship else { return }
         // Layout changes and reopening must not renew the five-minute lifetime.
         let unchanged = persistedSession?.transcript == transcript && persistedSession?.advice == advice &&
@@ -250,6 +257,13 @@ final class KeyboardViewController: UIInputViewController {
         mode = .idle; notice = "已清空本轮原文与结果。"; render()
     }
     private func render() {
+        if store?.cloudEnabled == true {
+            let current = try? SessionVault.read()
+            if current?.accountKey != cloudAccountKey {
+                invalidate(clearTranscript: true); cloudSnapshot = nil; cloudContext = nil; cloudAccountKey = nil
+                notice = "云账号已变化，请回主 App 登录并同步，再重新打开键盘。"
+            }
+        }
         persistSession()
         header.arrangedSubviews.forEach { $0.removeFromSuperview() }
         content.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -308,6 +322,10 @@ final class KeyboardViewController: UIInputViewController {
         updateHeight()
         if showTyping { return }
         if mode == .gate {
+            if hasFullAccess, store?.cloudEnabled == true {
+                content.addArrangedSubview(KB.label("请在主 App 登录云账号并同步。普通本地打字仍可使用。", size: 14))
+                return
+            }
             content.addArrangedSubview(KB.card([
                 KB.label("先启用键盘完全访问", size: 17, bold: true),
                 KB.label("设置 → 通用 → 键盘 → 键盘 → 狗头军师 → 允许完全访问。联网分析与共享配置需要这个开关。点顶部“打字”可继续本地输入。", size: 14)
@@ -315,6 +333,11 @@ final class KeyboardViewController: UIInputViewController {
             return
         }
         if store != nil { content.addArrangedSubview(contextButton()) }
+        if store?.cloudEnabled == true {
+            if mode == .insertConfirmation { insertionView() }
+            else { cloudPanel() }
+            return
+        }
         switch mode {
         case .idle:
             content.addArrangedSubview(KB.label("从聊天截图或已复制的消息读取，再核对并分析。", size: 14))
@@ -342,6 +365,9 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
     private func openScreenshot() {
+        if store?.cloudEnabled == true {
+            showTyping = false; notice = "云模式的新截图与原文请到主 App 用本地识别、核对并同步；键盘仅使用已同步上下文。"; render(); return
+        }
         guard mode != .loading else { return }
         guard hasFullAccess, store != nil else {
             showTyping = false; mode = .gate
@@ -509,6 +535,17 @@ final class KeyboardViewController: UIInputViewController {
     }
     private func contextButton() -> UIButton {
         let button = KB.button("\(relationship.label) · \(relationship.stage) · \(relationship.goal)", icon: "person.crop.circle")
+        if store?.cloudEnabled == true {
+            let objects = (cloudSnapshot?.profiles ?? []).map { profile in UIAction(title: profile.label) { [weak self] _ in
+                guard let self = self else { return }
+                self.invalidate(clearTranscript: true); self.relationship = profile
+                self.cloudContext = self.cloudSnapshot?.contexts.first { $0.profileUid == profile.id }
+                self.transcript = self.cloudContext?.transcript ?? ""; self.advice = self.cloudContext?.result?.advice()
+                self.mode = self.advice == nil ? .idle : .result; self.render()
+            } }
+            button.menu = UIMenu(children: objects); button.showsMenuAsPrimaryAction = true; button.isEnabled = mode != .loading
+            return button
+        }
         let profiles = store?.archived() ?? []
         let objects = profiles.map { profile in UIAction(title: profile.label) { [weak self] _ in self?.changeContext(profile, clearTranscript: true) } }
         let stages = Relationship.stages.map { stage in UIAction(title: stage, state: stage == relationship.stage ? .on : .off) { [weak self] _ in
@@ -618,6 +655,7 @@ final class KeyboardViewController: UIInputViewController {
         confirmed = false; render()
     }
     private func analyze(rewrite: Bool = false) {
+        if store?.cloudEnabled == true { analyzeCloudKeyboard(kind: rewrite ? "rewrite" : "analysis"); return }
         guard hasFullAccess else { mode = .gate; render(); return }
         do {
             let updated = store?.config() ?? config, context = store?.relationship() ?? relationship
@@ -658,6 +696,102 @@ final class KeyboardViewController: UIInputViewController {
                 }
             }
         } catch { notice = error.localizedDescription; footer.text = notice }
+    }
+    private func loadCloudCache() throws {
+        guard hasFullAccess, let store = store, let session = try SessionVault.read() else { throw CloudError.signIn }
+        config.ocr = .local
+        cloudAccountKey = session.accountKey
+        cloudSnapshot = try CloudCache.read(directory: store.cloudDirectory, accountKey: session.accountKey)
+        guard let snapshot = cloudSnapshot else { throw GoutouError.invalid("请先打开主 App 登录并同步人物与已确认聊天") }
+        relationship = snapshot.profiles.first { $0.id == snapshot.selectedProfileUid } ?? snapshot.profiles.first ?? Relationship(id: "cloud-empty", label: "请到主 App 新建人物")
+        cloudContext = snapshot.contexts.first { $0.profileUid == relationship.id }
+        transcript = cloudContext?.transcript ?? ""; advice = cloudContext?.result?.advice(); confirmed = false
+        mode = advice == nil ? .idle : .result
+        notice = "云端只读缓存 · 请核对当前对象；新截图或资料在主 App 确认同步。"
+    }
+    private func cloudPanel() {
+        content.addArrangedSubview(KB.label("已同步聊天 · 只读缓存", size: 15, bold: true))
+        if cloudSnapshot == nil {
+            content.addArrangedSubview(KB.label("请打开主 App 登录并同步。新截图和原文在主 App 核对，键盘不写入同步数据库。", size: 14))
+        } else if let context = cloudContext {
+            content.addArrangedSubview(KB.label(String(context.transcript.prefix(280)), size: 13))
+            if mode == .loading {
+                let spinner = UIActivityIndicatorView(style: .medium); spinner.startAnimating(); content.addArrangedSubview(spinner)
+                content.addArrangedSubview(KB.button("停止等待（保留云端任务）") { [weak self] in
+                    guard let self = self else { return }; self.invalidate(clearTranscript: false); self.mode = self.advice == nil ? .idle : .result; self.render()
+                })
+                return
+            }
+            if mode == .details { detailView() }
+            else if advice != nil { resultView() }
+            else { content.addArrangedSubview(KB.button("核对当前对象并分析已同步聊天", primary: true) { [weak self] in self?.analyzeCloudKeyboard(kind: "analysis") }) }
+            if advice != nil { content.addArrangedSubview(KB.button("请求云端详细解释") { [weak self] in self?.analyzeCloudKeyboard(kind: "explanation") }) }
+            if advice != nil { content.addArrangedSubview(KB.button("再次分析已同步聊天") { [weak self] in self?.analyzeCloudKeyboard(kind: "analysis") }) }
+            if let store = store, let key = cloudAccountKey,
+               let saved = CloudKeyboardJob.read(directory: store.cloudDirectory, accountKey: key) {
+                content.addArrangedSubview(KB.button(saved.pending.analysisId == nil ? "使用原请求 ID 重试提交" : "查询已有云端任务") { [weak self] in self?.analyzeCloudKeyboard(kind: saved.pending.kind, resume: true) })
+            }
+        } else { content.addArrangedSubview(KB.label("该人物暂无已同步聊天，请到主 App 核对原文后同步。", size: 14)) }
+        content.addArrangedSubview(KB.button("重新读取主 App 缓存") { [weak self] in
+            guard let self = self else { return }
+            do { self.invalidate(clearTranscript: true); try self.loadCloudCache() } catch { self.notice = error.localizedDescription; self.cloudSnapshot = nil; self.cloudContext = nil }
+            self.render()
+        })
+        content.addArrangedSubview(KB.label("普通打字可离线使用；联网与共享缓存需要完全访问。发送仍由你决定。", size: 12))
+    }
+    private func analyzeCloudKeyboard(kind: String, resume: Bool = false) {
+        guard hasFullAccess, let store = store, store.cloudEnabled, let context = cloudContext,
+              context.profileUid == relationship.id, !context.transcript.isEmpty else { notice = "请先在主 App 同步已确认聊天"; render(); return }
+        do {
+            guard let session = try SessionVault.read(), session.accountKey == cloudAccountKey else { throw CloudError.signIn }
+            let previous = CloudKeyboardJob.read(directory: store.cloudDirectory, accountKey: session.accountKey)
+            if previous != nil && !resume { throw GoutouError.invalid("已有待查询任务，请先使用原请求 ID 查询或重试") }
+            var pending: CloudPendingJob
+            if resume, let previous = previous {
+                guard previous.pending.conversationUid == context.id, previous.pending.contextRevision == context.contextRevision else { throw GoutouError.invalid("原任务属于另一段聊天；请回主 App 查询") }
+                pending = previous.pending
+            } else {
+                if kind != "analysis", context.result == nil { throw GoutouError.invalid("先同步该聊天的已有分析结果") }
+                pending = CloudPendingJob(requestId: UUID().uuidString.lowercased(), conversationUid: context.id, contextRevision: context.contextRevision,
+                    kind: kind, parentAnalysisId: context.result?.analysisId, analysisId: nil, preferences: config.cloudPreferences)
+            }
+            try CloudKeyboardJob(accountKey: session.accountKey, pending: pending).save(directory: store.cloudDirectory)
+            revision += 1; task?.cancel(); let generation = revision, profile = relationship.id, owner = session.accountKey
+            mode = .loading; notice = "云端任务可持久查询；停止等待不会重发模型请求。"; render()
+            task = Task { [weak self] in
+                do {
+                    let client = try GatewayClient(session: session)
+                    if pending.analysisId == nil {
+                        let accepted = try await client.create(pending, config: self?.config ?? AppConfig())
+                        pending.analysisId = accepted.analysisId
+                        try CloudKeyboardJob(accountKey: owner, pending: pending).save(directory: store.cloudDirectory)
+                    }
+                    for _ in 0..<45 {
+                        try Task.checkCancellation()
+                        let job = try await client.job(pending.analysisId!)
+                        guard let self = self, self.revision == generation, self.hasFullAccess,
+                              try SessionVault.read()?.accountKey == owner, self.relationship.id == profile,
+                              self.cloudContext?.id == context.id, self.cloudContext?.contextRevision == context.contextRevision else { return }
+                        guard job.conversationUid == context.id, job.contextRevision == context.contextRevision else { throw CloudError.protocolError }
+                        if job.status == "succeeded", let result = job.result {
+                            self.advice = result.advice(); self.cloudContext?.result = result; self.mode = .result
+                            self.notice = result.text ?? "云端分析完成；候选顺序与权重由服务器给出。"
+                            CloudKeyboardJob.remove(directory: store.cloudDirectory, accountKey: owner, requestId: pending.requestId)
+                            self.render(); return
+                        }
+                        if ["failed", "cancelled", "indeterminate"].contains(job.status) {
+                            CloudKeyboardJob.remove(directory: store.cloudDirectory, accountKey: owner, requestId: pending.requestId)
+                            throw GoutouError.invalid("任务 \(job.status)：\(job.error?.code ?? "结果不明；新任务需自行决定")")
+                        }
+                        try await Task.sleep(nanoseconds: 2_000_000_000)
+                    }
+                    self?.mode = self?.advice == nil ? .idle : .result; self?.notice = "任务仍在运行；可重新查询。"; self?.render()
+                } catch {
+                    guard let self = self, self.revision == generation else { return }
+                    self.mode = self.advice == nil ? .idle : .result; self.notice = error.localizedDescription; self.render()
+                }
+            }
+        } catch { notice = error.localizedDescription; render() }
     }
     private func resultView() {
         guard let advice = advice else { return }

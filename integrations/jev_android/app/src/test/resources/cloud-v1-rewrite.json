@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "analysis_id": "70000000-0000-4000-8000-000000000001",
+  "conversation_uid": "20000000-0000-4000-8000-000000000001",
+  "context_revision": 3,
+  "facts": [],
+  "hypotheses": [],
+  "unknowns": [],
+  "strategy": "降压",
+  "stop_condition": "对方要求停止时停止",
+  "candidates": [],
+  "ranking_status": "unavailable",
+  "usage": {},
+  "pipeline_version": "cloud-v1",
+  "text": "嗯，你先忙，咱们有空再聊。"
+}

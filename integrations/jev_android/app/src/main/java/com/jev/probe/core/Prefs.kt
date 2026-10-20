@@ -13,7 +13,27 @@ import android.util.Log
  */
 class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
+    private val app = context.applicationContext
     private val sp = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+
+    /** Cloud is an explicit choice; failures never select a provider route. */
+    var cloudEnabled: Boolean
+        get() = sp.getBoolean("cloud_enabled", false)
+        set(v) = synchronized(com.jev.probe.cloud.CloudAccountBoundary.lock) {
+            if (cloudEnabled != v) {
+                sp.edit().putBoolean("cloud_enabled", v).apply()
+                com.jev.probe.cloud.CloudAccountBoundary.changed()
+            }
+        }
+    var cloudBaseUrl: String
+        get() = sp.getString("cloud_base_url", "https://api.zovoeh.cn") ?: "https://api.zovoeh.cn"
+        set(v) = sp.edit().putString("cloud_base_url", v).apply()
+    val installationId: String
+        get() = synchronized(Prefs::class.java) {
+            sp.getString("cloud_installation_id", null) ?: java.util.UUID.randomUUID().toString().also {
+                check(sp.edit().putString("cloud_installation_id", it).commit()) { "无法保存来源设备标识" }
+            }
+        }
 
     /**
      * Only the real config migrates — and only the real config logs it. The
@@ -149,7 +169,7 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
 
     /** "mlkit" | "vision". */
     var ocrEngine: String
-        get() = sp.getString(K_OCR_ENGINE, OCR_MLKIT) ?: OCR_MLKIT
+        get() = if (cloudEnabled) OCR_MLKIT else sp.getString(K_OCR_ENGINE, OCR_MLKIT) ?: OCR_MLKIT
         set(v) = sp.edit().putString(K_OCR_ENGINE, v.trim()).apply()
 
     /** Run generic OCR capture on apps with no dedicated adapter. */
@@ -254,7 +274,8 @@ class Prefs(context: Context, prefsName: String = PREFS_MAIN) {
     }
 
     /** Readiness gate: the judge route is the one that must be configured. */
-    fun hasKey(): Boolean = if (strategyProvider == "deepseek") effectiveStrategyKey().isNotBlank()
+    fun hasKey(): Boolean = if (cloudEnabled) com.jev.probe.cloud.SessionStore(app).load() != null
+                            else if (strategyProvider == "deepseek") effectiveStrategyKey().isNotBlank()
                             else judgeKey.isNotBlank()
 
     companion object {

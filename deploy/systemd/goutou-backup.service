@@ -1,0 +1,9 @@
+[Unit]
+Description=Consistent local backup of Goutou services
+After=goutou-pocketbase.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/goutou-backup
+UMask=0077
+TimeoutStartSec=10min

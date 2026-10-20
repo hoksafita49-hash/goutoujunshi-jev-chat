@@ -14,6 +14,13 @@ struct ProviderView: View {
 
     var body: some View {
         Form {
+            Section("运行方式") {
+                Toggle("使用统一云服务", isOn: Binding(get: { model.cloudEnabled }, set: { model.setCloudEnabled($0); draft = model.config }))
+                Text(model.cloudEnabled ? "账号、人物与已确认聊天经同一网关；截图只在手机本地识别。" : "直连接口模式，使用本机自行配置的服务商 Key。")
+                    .font(.caption).foregroundStyle(Palette.secondary)
+            }
+            if model.cloudEnabled { CloudAccountView() }
+            if !model.cloudEnabled {
             Section("策略判断与回复生成") {
                 Picker("策略判断", selection: $draft.judge) { ForEach(JudgeProvider.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 Picker("回复生成", selection: $draft.reply) { ForEach(ReplyProvider.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
@@ -41,10 +48,14 @@ struct ProviderView: View {
                 keyField("jev", value: $jevKey)
                 Button("测试 Jev 判断") { testJev() }.disabled(testing)
             }
+            }
             Section("截图识别") {
+                if model.cloudEnabled { Text("Apple Vision · 本地识别；本阶段不上传截图。") }
+                else {
                 Picker("识别方式", selection: $draft.ocr) { ForEach(OCRProvider.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
                 Text("Apple Vision 在手机本地识别。云端识图会发送你选的截图，使用对应服务的 Key 并产生用量；键盘自身不截屏，日常拼音和英文输入在本机完成。")
                     .font(.caption).foregroundStyle(Palette.secondary)
+                }
             }
             Section("回复偏好") {
                 Picker("口吻", selection: $draft.tone) { ForEach(["稳健", "会撩", "直接"], id: \.self) { Text($0).tag($0) } }
@@ -57,7 +68,7 @@ struct ProviderView: View {
                 if testing { HStack { ProgressView(); Button("取消测试") { cancelTest(); message = "已取消" } } }
                 Text(message).font(.footnote).foregroundStyle(Palette.secondary).textSelection(.enabled)
             } footer: {
-                Text("密钥保存在 App 与键盘共享的本机钥匙串，已存 Key 不回显；空白表示保留原 Key。聊天仅在你确认分析时发送到所选接口。")
+                Text(model.cloudEnabled ? "账号会话保存在共享钥匙串。确认后的聊天才同步；服务器统一配置模型，候选发送由你决定。" : "密钥保存在 App 与键盘共享的本机钥匙串，已存 Key 不回显；空白表示保留原 Key。聊天仅在你确认分析时发送到所选接口。")
             }
             Section("本地数据") {
                 Button("清除键盘暂存与等待取用的内容") {
@@ -68,7 +79,7 @@ struct ProviderView: View {
             }
         }
         .scrollContentBackground(.hidden).background(Palette.cream)
-        .onAppear { draft = model.config; refreshKeys() }
+        .onAppear { draft = model.config; if !model.cloudEnabled { refreshKeys() } }
         .onDisappear { cancelTest(); deepseekKey = ""; openrouterKey = ""; jevKey = "" }
     }
 
@@ -108,12 +119,14 @@ struct ProviderView: View {
         do {
             try draft.validate()
             guard let store = model.store else { throw GoutouError.invalid("App Group 未连接") }
-            for (name, value) in [("deepseek", deepseekKey), ("openrouter", openrouterKey), ("jev", jevKey)] where !value.trimmed.isEmpty {
+            if model.cloudEnabled { draft.ocr = .local }
+            for (name, value) in [("deepseek", deepseekKey), ("openrouter", openrouterKey), ("jev", jevKey)] where !model.cloudEnabled && !value.trimmed.isEmpty {
                 try CredentialVault.write(value, name: name)
             }
+            if model.cloudEnabled { try model.saveCloudPreferences(draft) }
             try store.saveConfig(draft)
             deepseekKey = ""; openrouterKey = ""; jevKey = ""
-            refreshKeys(); model.reload(); message = "已保存，下一次键盘分析使用新配置。"
+            if !model.cloudEnabled { refreshKeys() }; model.reload(); message = "已保存，下一次分析使用新配置。"
         } catch { message = error.localizedDescription }
     }
     private func testButton(_ title: String, provider: ReplyProvider) -> some View {
@@ -175,11 +188,12 @@ struct RelationshipView: View {
                 Picker("本轮目标", selection: $draft.goal) { ForEach(Relationship.goals, id: \.self) { Text($0).tag($0) } }
                 TextField("最近发生了什么（最多 200 字）", text: $draft.background, axis: .vertical).lineLimit(3...6)
                 TextField("需要遵守的边界或备注（最多 200 字）", text: $draft.notes, axis: .vertical).lineLimit(2...4)
-                Toggle("同时保存为可切换的对象档案", isOn: $archive)
+                if !model.cloudEnabled { Toggle("同时保存为可切换的对象档案", isOn: $archive) }
                 Button("保存当前对象与目标") {
                     do {
                         guard let store = model.store else { throw GoutouError.invalid("共享配置未连接") }
-                        try store.saveRelationship(draft, archive: archive); model.reload(); profiles = store.archived()
+                        if model.cloudEnabled { try model.saveCloudProfile(draft); profiles = model.cloudProfiles }
+                        else { try store.saveRelationship(draft, archive: archive); model.reload(); profiles = store.archived() }
                         message = "已保存；下次分析前请核对聊天对象。"
                     } catch { message = error.localizedDescription }
                 }.buttonStyle(BrandPrimaryButtonStyle())
@@ -187,27 +201,38 @@ struct RelationshipView: View {
             } header: {
                 Text("当前对象")
             } footer: {
-                Text("只保存你主动填写的对象资料，不保存整份聊天。分析时会把当前对象的阶段、目标、背景与本轮原文交给所选模型。键盘无法自动识别聊天对象，换会话后请手动选择。")
+                Text(model.cloudEnabled ? "保存后进入当前账号的同步队列。键盘从主 App 发布的快照读取人物，切换聊天后请手动核对对象。" : "只保存你主动填写的对象资料，不保存整份聊天。分析时会把当前对象的阶段、目标、背景与本轮原文交给所选模型。键盘无法自动识别聊天对象，换会话后请手动选择。")
             }
             Section("已保存的对象") {
                 Button("新建对象") { draft = Relationship(); archive = true }
                 ForEach(profiles) { profile in
-                    Button { draft = profile; archive = true; message = "已载入，点保存后应用到键盘。" } label: {
+                    Button { draft = profile; archive = true; if model.cloudEnabled { model.selectCloudProfile(profile) }; message = "已载入当前对象。" } label: {
                         VStack(alignment: .leading) { Text(profile.label); Text(profile.stage + " · " + profile.goal).font(.caption).foregroundStyle(Palette.secondary) }
                     }
                 }.onDelete { indices in
                     do {
                         guard let store = model.store else { return }
-                        for index in indices { try store.deleteProfile(profiles[index].id) }
-                        profiles = store.archived(); model.reload(); draft = model.relationship
+                        for index in indices {
+                            if model.cloudEnabled { try model.deleteCloudProfile(profiles[index].id) }
+                            else { try store.deleteProfile(profiles[index].id) }
+                        }
+                        profiles = model.cloudEnabled ? model.cloudProfiles : store.archived(); model.reload(); draft = model.relationship
                     } catch { message = error.localizedDescription }
                 }
                 Button("删除所有对象资料", role: .destructive) { deleteAll = true }
             }
         }.scrollContentBackground(.hidden).background(Palette.cream)
-            .onAppear { draft = model.relationship; profiles = model.store?.archived() ?? [] }
+            .onAppear {
+                draft = model.cloudEnabled && UUID(uuidString: model.relationship.id) == nil ? Relationship() : model.relationship
+                profiles = model.cloudEnabled ? model.cloudProfiles : model.store?.archived() ?? []
+            }
+            .onChange(of: model.cloudProfiles) { value in if model.cloudEnabled { profiles = value } }
             .confirmationDialog("删除所有本机对象资料？", isPresented: $deleteAll, titleVisibility: .visible) {
-                Button("删除所有资料", role: .destructive) { model.store?.clearProfiles(); model.reload(); draft = model.relationship; profiles = [] }
+                Button("删除所有资料", role: .destructive) {
+                    if model.cloudEnabled { do { for profile in profiles { try model.deleteCloudProfile(profile.id) } } catch { message = error.localizedDescription } }
+                    else { model.store?.clearProfiles() }
+                    model.reload(); draft = model.relationship; profiles = []
+                }
             }
     }
 }

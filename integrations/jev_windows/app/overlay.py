@@ -452,7 +452,8 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", 23, "#24382d", True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED))
+        self.settingsIntro = _label("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED)
+        body.addWidget(self.settingsIntro)
         preference = _Surface()
         box = QVBoxLayout(preference)
         box.setContentsMargins(16, 16, 16, 18)
@@ -570,7 +571,8 @@ class Overlay:
         save_profile = PushButton("保存当前会话档案")
         save_profile.clicked.connect(self._save_profile)
         profile_box.addWidget(save_profile)
-        profile_box.addWidget(_label("只在主动保存后记录对象称呼、阶段、目标和补充背景；不保存完整聊天。", 11, _MUTED))
+        self.profileStorageHint = _label("只在主动保存后记录对象称呼、阶段、目标和补充背景；不保存完整聊天。", 11, _MUTED)
+        profile_box.addWidget(self.profileStorageHint)
         body.addWidget(profile)
 
         models = _Surface()
@@ -616,6 +618,7 @@ class Overlay:
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
         body.addWidget(models)
+        self.modelsSurface = models
         ocr = _Surface()
         ocr_box = QVBoxLayout(ocr)
         ocr_box.setContentsMargins(16, 16, 16, 18)
@@ -635,6 +638,7 @@ class Overlay:
         ocr_box.addWidget(self.ocrKeyEdit)
         ocr_box.addWidget(self._hint("选择云端识图后，聊天区截图会发送到所选服务并可能计费；识别后仍需核对原文。"))
         body.addWidget(ocr)
+        self.ocrSurface = ocr
         self.settingsFeedback = _label("", 13, _GREEN)
         self.settingsFeedback.hide()
         body.addWidget(self.settingsFeedback)
@@ -649,6 +653,9 @@ class Overlay:
         body.addLayout(actions)
         body.addWidget(self._hint("保存后用于下一次生成的回复。"))
         body.addStretch(1)
+        from app.cloud_ui import CloudPanel
+        self.cloudPanel = CloudPanel(self)
+        body.insertWidget(2, self.cloudPanel)
         self._load_settings()
 
     def _hint(self, text):
@@ -732,6 +739,8 @@ class Overlay:
         """两组共用：密钥已配置/未配置、占位文案、自定义 Base URL 行的显隐，
         外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
         minimumSizeHint 按整段文字算，不会自动换行/省略，长名字会把设置页撑宽。"""
+        if settings.cloud_mode():
+            return
         for group in (self.jev, self.draft):
             provider = self._provider_of(group)
             name = group.table[provider].name
@@ -748,6 +757,8 @@ class Overlay:
 
     def _fetch_models(self, group):
         """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
+        if settings.cloud_mode():
+            return
         provider = self._provider_of(group)
         custom = group.kind == "draft" and provider in providers.CUSTOM
         base = self.baseEdit.text().strip() if custom else None
@@ -802,6 +813,13 @@ class Overlay:
         group.status.setText("")
 
     def _load_settings(self):
+        cloud = settings.cloud_mode()
+        self.settingsIntro.setText("登录云账号并同步人物与已确认聊天；模型由服务端统一管理。" if cloud else
+                                   "调整关系背景，配置判断和起草用的两个模型。")
+        self.profileStorageHint.setText("人物资料与已确认聊天按账号保存并同步；未核对的 OCR 留在本机。" if cloud else
+                                        "只在主动保存后记录对象称呼、阶段、目标和补充背景；不保存完整聊天。")
+        self.modelsSurface.setVisible(not cloud)
+        self.ocrSurface.setVisible(not cloud)
         relationship = settings.relationship()
         index = next((i for i, (_, value) in enumerate(_RELATIONSHIPS) if value == relationship),
                      len(_RELATIONSHIPS) - 1)
@@ -817,12 +835,12 @@ class Overlay:
         self.strategyProviderBox.setCurrentIndex(1 if settings.strategy_provider() == "deepseek" else 0)
         self.strategyModelEdit.setText(settings.strategy_model())
         self.strategyKeyEdit.clear()
-        self.strategyKeyEdit.setPlaceholderText("已配置，留空保留" if settings.strategy_key() else
+        self.strategyKeyEdit.setPlaceholderText("已配置，留空保留" if not cloud and settings.strategy_key() else
                                                 "DeepSeek 策略密钥；DeepSeek 回复可复用回复密钥")
         self.ocrProviderBox.setCurrentIndex(("local", "deepseek", "openrouter").index(settings.ocr_provider()))
         self.ocrModelEdit.setText(settings.ocr_model())
         self.ocrKeyEdit.clear()
-        self.ocrKeyEdit.setPlaceholderText("已配置，留空保留" if settings.ocr_key() else
+        self.ocrKeyEdit.setPlaceholderText("已配置，留空保留" if not cloud and settings.ocr_key() else
                                             "图片识别密钥；同来源的回复密钥可复用")
         self._ocr_changed()
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
@@ -834,6 +852,7 @@ class Overlay:
         title = self._shown or self._chat
         self.profileTitle.setText(f"当前会话：{title}" if title else "请先识别并选择会话")
         current = settings.profile_of(title)
+        self._cloudProfile = current
         self.profileStage.setCurrentIndex(settings.STAGES.index(current["stage"])
                                           if current["stage"] in settings.STAGES else 0)
         self.profileGoal.setCurrentIndex(settings.GOALS.index(current["goal"])
@@ -846,8 +865,11 @@ class Overlay:
         try:
             settings.save_profile(title, settings.STAGES[self.profileStage.currentIndex()],
                                   settings.GOALS[self.profileGoal.currentIndex()],
-                                  self.profileBackground.toPlainText().strip())
-        except ValueError as exc:
+                                  self.profileBackground.toPlainText().strip(),
+                                  expected_uid=self._cloudProfile.get("_cloud_uid"),
+                                  expected_version=self._cloudProfile.get("_cloud_version"),
+                                  original_payload=self._cloudProfile.get("_cloud_original"))
+        except (ValueError, RuntimeError) as exc:
             self._settings_feedback(str(exc), error=True)
             return
         self._settings_feedback("当前会话档案已保存；下轮分析生效。")
@@ -855,6 +877,18 @@ class Overlay:
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
+        if settings.cloud_mode():
+            try:
+                settings.save(relationship, self.contextBox.value(), style_text=self.styleEdit.text().strip(),
+                              reply_target_on=self.targetSwitch.isChecked(), auto_analyze_on=self.autoSwitch.isChecked(),
+                              target_app_text=profiles.QQ if self.targetAppBox.currentIndex() == 1 else profiles.WECHAT,
+                              check_update_on=self.updateSwitch.isChecked())
+                if self.on_settings_saved:
+                    self.on_settings_saved()
+                self._settings_feedback("云模式偏好已保存；模型配置由服务端管理。")
+            except Exception as exc:
+                self._settings_feedback(str(exc)[:180], error=True)
+            return
         jev_provider = self._provider_of(self.jev)
         draft_provider = self._provider_of(self.draft)
         base = self.baseEdit.text().strip()
@@ -962,6 +996,9 @@ class Overlay:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
+        if settings.cloud_mode():
+            self.cloudPanel.email.setFocus()
+            return
         (self.relationshipBox if settings.has_key() else
          self.strategyKeyEdit if settings.strategy_provider() == "deepseek" else self.jev.keyEdit).setFocus()
 
@@ -1030,7 +1067,7 @@ class Overlay:
         elif configured:
             self.set_status("等待新消息", "idle")
         else:
-            self.set_status("请先在设置中配置模型", "warning")
+            self.set_status("请先在设置中登录云账号" if settings.cloud_mode() else "请先在设置中配置模型", "warning")
         if self._busy or self.cands:  # 正在生成或已有候选时，空态卡片本来就看不见
             return
         if not on:
@@ -1064,6 +1101,8 @@ class Overlay:
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
         self.emptyHint.setText("保持聊天窗口打开（目标应用在设置里选）。\n收到新消息后，回复建议会出现在这里。"
                                if configured else "配置模型和关系背景，\n让建议更贴近你们的对话。")
+        if not configured and settings.cloud_mode():
+            self.emptyHint.setText("在设置中应用服务器地址并登录账号。\n关联人物后，核对原文再提交分析。")
         self.setupButton.setVisible(not configured)
 
     def invalidate_replies(self):
@@ -1261,7 +1300,8 @@ class Overlay:
         if not any(scores):  # 全 0/None（旧结果或接口未返回）就不展示百分比
             scores = [None] * len(self.cands)
         # 按概率降序排，推荐位（API 给的 choice）强制第一，同分按原索引
-        order = sorted(range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
+        order = list(range(len(self.cands))) if result.get("server_order") else sorted(
+            range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
         for position, index in enumerate(order):
             card = _ReplyCard(self, index, recommended=index == best, number=position, score=scores[index])
             self.replyBox.addWidget(card)
@@ -1277,6 +1317,8 @@ class Overlay:
             kind = (f"策略选择权重 {weight:.1%}" if decision.get("method") == "deepseek_logprobs"
                     else "策略 token 权重暂不可用")
             self.strategyInfo.setText(f"DeepSeek 主策略 · {decision['strategy']} · {kind}；不是回复成功率")
+        elif result.get("server_order"):
+            self.strategyInfo.setText("云端统一策略 · 候选按服务端顺序展示")
         else:
             self.strategyInfo.setText("Jev 策略判断")
         confidence = reading.get("intent_confidence")

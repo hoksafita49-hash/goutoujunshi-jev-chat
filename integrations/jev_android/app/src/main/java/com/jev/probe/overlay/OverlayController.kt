@@ -55,7 +55,7 @@ class OverlayController(private val ctx: Context) {
     var onManualAnalyze: (() -> Unit)? = null
     var onDetails: (() -> Unit)? = null
     var onExplain: ((String) -> Unit)? = null
-    var onRewrite: (() -> Unit)? = null
+    var onRewrite: ((String) -> Unit)? = null
 
     /** Bubble menu → file the open conversation as a knowledge-base contact. */
     var onSaveContact: (() -> Unit)? = null
@@ -489,6 +489,18 @@ class OverlayController(private val ctx: Context) {
         if (!expanded) toggle()
     }
 
+    fun showRewriteVariant(original: String, rewritten: String, onFill: (String) -> Unit) {
+        ensureRoot()
+        val actions = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        actions.addView(pill("复制改写", false) { copy(rewritten) })
+        actions.addView(pill("填入改写", true) { onFill(rewritten); if (expanded) toggle() })
+        setContent(listOf(line("更像我一点", "#24382d", 17f, true),
+            hint("原候选 · $original"), line(rewritten, "#374151", 15f),
+            hint("这是单独改写版本，未参与原候选排序；原分析与候选保留。"), actions,
+            bigButton("返回原候选回复") { showCandidateReplies() }))
+        if (!expanded) toggle()
+    }
+
     fun toast(msg: String) = Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
 
     fun hide() {
@@ -514,7 +526,8 @@ class OverlayController(private val ctx: Context) {
 
         // What context this read was based on (knowledge base / remembered history).
         views.add(hint(
-            if (ctxNotes == 0 && ctxHistory == 0) "未用知识库"
+            if (a.analysisId != null) "云端上下文版本 ${a.contextRevision} · 资料与确认历史由服务器读取"
+            else if (ctxNotes == 0 && ctxHistory == 0) "未用知识库"
             else "知识库 $ctxNotes 条 · 历史 $ctxHistory 条"))
 
         // How this snapshot was captured, when it changes how to read it.
@@ -538,7 +551,7 @@ class OverlayController(private val ctx: Context) {
             val weight = a.strategyWeights[strategy]
             val detail = if (weight != null) "策略选择权重 ${(weight * 100).roundToInt()}%"
                          else "策略 token 权重暂不可用"
-            views.add(hint("DeepSeek 主策略 · $strategy · $detail；不是回复成功率"))
+            views.add(hint(if (a.analysisId != null) "云端策略 · $strategy" else "DeepSeek 主策略 · $strategy · $detail；不是回复成功率"))
         }
         // Compact secondary line: needs · action · reply-now.
         val bits = ArrayList<String>()
@@ -554,27 +567,28 @@ class OverlayController(private val ctx: Context) {
             }
             val facts = a.facts.takeIf { it.isNotEmpty() }?.joinToString("\n") ?: quoted
             if (facts.isNotBlank()) views.add(hint("已核对原文\n$facts"))
+            if (a.hypotheses.isNotEmpty()) views.add(hint("待确认推测 · " + a.hypotheses.joinToString("；")))
             views.add(hint("仍未知 · " + (a.unknowns.joinToString("；").ifBlank {
                 "仅凭屏幕片段无法确认对方内心、完整上下文和线下情况。" })))
             val boundary = GoutouGuidance.explicitBoundary(snap)
             views.add(line("军师建议 · " + (if (boundary) "尊重停止联系要求" else
-                GoutouGuidance.actionLabel(a.bestAction?.choice)), "#2B5245", 13f, true))
+                GoutouGuidance.actionLabel(a.strategy ?: a.bestAction?.choice)), "#2B5245", 13f, true))
             views.add(hint("下一步 · " + (if (boundary) "先停止联系，等对方主动重启对话。" else
-                GoutouGuidance.nextStep(a.bestAction?.choice))))
-            views.add(hint("停止条件 · ${GoutouGuidance.stopCondition}"))
+                GoutouGuidance.nextStep(a.strategy ?: a.bestAction?.choice))))
+            views.add(hint("停止条件 · ${a.stopCondition.ifBlank { GoutouGuidance.stopCondition }}"))
             views.add(hint("OCR 原文和说话人需核对；判断把握不是对方真实意图概率。"))
         }
 
         views.add(divider())
-        views.add(line("候选回复排序（${if (a.strategy != null) "DeepSeek" else "Jev"}）", "#68776F", 12f))
+        views.add(line("候选回复排序（${if (a.analysisId != null) "统一云流程" else if (a.strategy != null) "DeepSeek" else "Jev"}）", "#68776F", 12f))
         if (generating) {
             views.add(hint("生成中…"))
         } else {
             val fill = lastFill ?: {}
             a.rankedReplies.forEachIndexed { i, r ->
-                views.add(replyCard(i + 1, r.text, (r.prob * 100).roundToInt(), fill))
+                views.add(replyCard(i + 1, r.text, r.prob?.let { (it * 100).roundToInt() }, fill))
             }
-            if (a.rankedReplies.isNotEmpty() && a.rankedReplies.all { it.prob == 0.0 })
+            if (a.rankedReplies.isNotEmpty() && a.rankedReplies.all { it.prob == null })
                 views.add(hint("排序暂不可用，候选保留生成顺序。"))
             if (a.rankedReplies.isEmpty()) {
                 val msg = replyError?.let { "回复接口出错：$it" }
@@ -586,8 +600,6 @@ class OverlayController(private val ctx: Context) {
         views.add(reAnalyzeBtn())
         if (!generating) {
             views.add(pill("详细分析", false) { onDetails?.invoke() })
-            if (a.rankedReplies.isNotEmpty())
-                views.add(pill("更像我一点", false) { onRewrite?.invoke() })
         }
 
         setContent(views)
@@ -613,7 +625,7 @@ class OverlayController(private val ctx: Context) {
         return row
     }
 
-    private fun replyCard(rank: Int, text: String, pct: Int, onFill: (String) -> Unit): View {
+    private fun replyCard(rank: Int, text: String, pct: Int?, onFill: (String) -> Unit): View {
         val top = rank == 1
         val cardBg = if (top) Color.parseColor("#EAF4EF") else Color.parseColor("#F3F4F2")
         val c = LinearLayout(ctx).apply {
@@ -625,7 +637,7 @@ class OverlayController(private val ctx: Context) {
             ).apply { topMargin = dp(6) }
         }
         c.addView(TextView(ctx).apply {
-            this.text = if (pct > 0) "#$rank · 相对权重 ${pct}%" else "#$rank · 排序待定"
+            this.text = if (pct != null) "#$rank · 相对权重 ${pct}%" else "#$rank · 排序不可用"
             setTextColor(Color.parseColor("#2B5245")); textSize = 11f
             setTypeface(typeface, Typeface.BOLD)
         })
@@ -639,6 +651,7 @@ class OverlayController(private val ctx: Context) {
         btns.addView(pill("填入", true) { android.util.Log.d("JEVASSIST", "overlay: fill tapped"); onFill(text); if (expanded) toggle() })
         c.addView(btns)
         c.addView(pill("为什么这样回", false) { onExplain?.invoke(text) })
+        c.addView(pill("更像我一点", false) { onRewrite?.invoke(text) })
         return c
     }
 

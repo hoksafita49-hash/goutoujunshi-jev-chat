@@ -9,6 +9,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
+        android:name=".cloud.CloudApplication"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -27,6 +28,8 @@
         <activity
             android:name=".SettingsActivity"
             android:exported="false" />
+
+        <activity android:name=".CloudAccountActivity" android:exported="false" />
 
         <activity
             android:name=".CaptureInputActivity"

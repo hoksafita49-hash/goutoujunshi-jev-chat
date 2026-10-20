@@ -55,9 +55,17 @@ data class Analysis(
     val strategyWeights: Map<String, Double> = emptyMap(),
     val strategyMethod: String? = null,
     val facts: List<String> = emptyList(),
-    val unknowns: List<String> = emptyList()
+    val unknowns: List<String> = emptyList(),
+    val analysisId: String? = null,
+    val conversationUid: String? = null,
+    val contextRevision: Int? = null,
+    val cloudAccount: String? = null,
+    val cloudProfileUid: String? = null,
+    val cloudDeviceId: String? = null,
+    val stopCondition: String = "",
+    val hypotheses: List<String> = emptyList()
 )
 
 data class Choice(val choice: String, val confidence: Double, val probabilities: Map<String, Double>)
 data class Score(val score: Double, val confidence: Double, val maxLevel: Int)
-data class RankedReply(val text: String, val prob: Double)
+data class RankedReply(val text: String, val prob: Double?, val candidateId: String? = null)
