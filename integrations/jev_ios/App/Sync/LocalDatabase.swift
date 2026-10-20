@@ -80,16 +80,50 @@ final class CloudDatabase {
         return records.values.filter { $0.deletedAt == nil }.sorted { $0.uid < $1.uid }
     }
     private func enqueue(_ operation: CloudOperation) throws { try execute("INSERT INTO outbox(op_id,body,state) VALUES(?,?,'pending')", [operation.opId, try text(operation)]) }
-    private func stageInside(entityType: String, uid: String, payload: [String: JSONValue], action: String = "upsert") throws {
+    private func stageInside(entityType: String, uid: String, payload: [String: JSONValue], action: String = "upsert", baseVersion: Int? = nil) throws {
         guard UUID(uuidString: uid) != nil else { throw GoutouError.invalid("云端人物必须使用 UUID；请先预览导入旧资料") }
         let record = try remoteRecords(entityType).first { $0.uid == uid }
         guard record?.deletedAt == nil else { throw GoutouError.invalid("该资料已删除，不能恢复旧记录") }
         // Every queued operation is immutable. Never change a possibly accepted
         // operation's payload under the same idempotency ID.
-        try enqueue(.init(entityType: entityType, entityUid: uid, baseVersion: record?.version ?? 0, action: action, payload: payload))
+        try enqueue(.init(entityType: entityType, entityUid: uid, baseVersion: baseVersion ?? record?.version ?? 0, action: action, payload: payload))
     }
-    func stage(entityType: String, uid: String, payload: [String: JSONValue], action: String = "upsert") throws {
-        try transaction { try stageInside(entityType: entityType, uid: uid, payload: payload, action: action) }
+    func stage(entityType: String, uid: String, payload: [String: JSONValue], action: String = "upsert", baseVersion: Int? = nil) throws {
+        try transaction { try stageInside(entityType: entityType, uid: uid, payload: payload, action: action, baseVersion: baseVersion) }
+    }
+    func hasPending(entityType: String, uid: String) throws -> Bool {
+        try operations().contains { $0.entityType == entityType && $0.entityUid == uid }
+    }
+    func memories(profileUid: String) throws -> [CloudRecord] {
+        try visibleRecords("memories").filter { $0.payload["profile_uid"]?.string == profileUid }
+    }
+    func saveMemory(uid: String, draft: CloudMemoryDraft, expectedVersion: Int? = nil) throws {
+        try transaction {
+            guard try visibleRecords("profiles").contains(where: { $0.uid == draft.profileUid }) else { throw GoutouError.invalid("先选择当前账号的人物") }
+            let existing = try visibleRecords("memories").first { $0.uid == uid }
+            guard existing == nil || existing?.payload["profile_uid"]?.string == draft.profileUid else { throw CloudError.protocolError }
+            let messages = try visibleRecords("messages")
+            for source in Set(draft.sourceUids) {
+                guard messages.contains(where: { $0.uid == source && $0.payload["profile_uid"]?.string == draft.profileUid && $0.payload["confirmed"] == .bool(true) }) else {
+                    throw GoutouError.invalid("引用消息已不可用或不属于当前人物；请核对来源。")
+                }
+            }
+            var reviewed = draft
+            let previous = existing.map(CloudMemoryDraft.init(record:))
+            if previous == nil || previous?.text != draft.text || previous?.kind != draft.kind || Set(previous?.sourceUids ?? []) != Set(draft.sourceUids) { reviewed.status = "pending" }
+            // Validate the user's original request before applying the pending rule.
+            _ = try draft.payload()
+            try stageInside(entityType: "memories", uid: uid, payload: reviewed.payload(preserving: existing?.payload ?? [:]), baseVersion: expectedVersion)
+        }
+    }
+    func restoreMemory(_ revision: CloudRecord) throws {
+        guard revision.entityType == "memories", revision.deletedAt == nil,
+              let current = try remoteRecords("memories").first(where: { $0.uid == revision.uid && $0.deletedAt == nil }),
+              current.payload["profile_uid"]?.string == revision.payload["profile_uid"]?.string else {
+            throw GoutouError.invalid("该记忆已删除或不属于当前人物，无法恢复。")
+        }
+        var draft = CloudMemoryDraft(record: revision); draft.status = "pending"; draft.changeReason = "恢复版本 \(revision.version)"
+        try saveMemory(uid: current.uid, draft: draft, expectedVersion: current.version)
     }
     func applyPull(_ page: CloudPullResponse) throws {
         if let epoch = try meta("epoch"), epoch != page.serverEpoch { try preserveRecovery(); throw CloudError.recovery }

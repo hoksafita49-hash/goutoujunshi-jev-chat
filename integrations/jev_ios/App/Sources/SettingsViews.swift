@@ -61,6 +61,8 @@ struct ProviderView: View {
                 Picker("口吻", selection: $draft.tone) { ForEach(["稳健", "会撩", "直接"], id: \.self) { Text($0).tag($0) } }
                 Picker("长度", selection: $draft.length) { ForEach(["简短", "适中", "详细"], id: \.self) { Text($0).tag($0) } }
                 Stepper("最多 \(draft.count) 条候选", value: $draft.count, in: 1...3)
+                TextField("我的表达风格（选填）", text: Binding(get: { draft.style ?? "" }, set: { draft.style = $0 }), axis: .vertical).lineLimit(2...5)
+                Text("例如：自然、少用表情。清空后保存可移除已有风格。最多 500 字。") .font(.caption).foregroundStyle(Palette.secondary)
             }
             Section {
                 Button("保存并应用配置") { save() }.buttonStyle(BrandPrimaryButtonStyle())
@@ -80,6 +82,7 @@ struct ProviderView: View {
         }
         .scrollContentBackground(.hidden).background(Palette.cream)
         .onAppear { draft = model.config; if !model.cloudEnabled { refreshKeys() } }
+        .onChange(of: model.config) { updated in if !testing { draft = updated } }
         .onDisappear { cancelTest(); deepseekKey = ""; openrouterKey = ""; jevKey = "" }
     }
 

@@ -167,4 +167,24 @@ final class SyncCoordinator {
         if ["succeeded", "failed", "cancelled", "indeterminate"].contains(job.status) { try db.removePending(pending.requestId) }
         return job
     }
+    func evidence(analysisId: String, context: CloudContext) async throws -> CloudEvidenceDocument {
+        guard let session = session, context.result?.analysisId == analysisId else { throw CloudError.signIn }
+        let capturedGeneration = generation
+        var value = try await client(session).evidence(analysisId)
+        try checkCurrent(session, generation: capturedGeneration)
+        guard value.analysisId == analysisId, value.profileUid == context.profileUid,
+              value.conversationUid == context.conversationUid, value.contextRevision == context.contextRevision else { throw CloudError.protocolError }
+        if value.evidence.isEmpty { value.evidence = context.result?.displayEvidence ?? [] }
+        return value
+    }
+    func memoryHistory(uid: String, profileUid: String, beforeVersion: Int = 0) async throws -> CloudMemoryHistory {
+        guard let session = session else { throw CloudError.signIn }
+        let capturedGeneration = generation
+        let value = try await client(session).memoryHistory(uid, beforeVersion: beforeVersion)
+        try checkCurrent(session, generation: capturedGeneration)
+        guard value.memoryUid == uid, value.profileUid == profileUid,
+              !value.hasMore || (value.nextBeforeVersion > 0 && (beforeVersion == 0 || value.nextBeforeVersion < beforeVersion)),
+              value.versions.allSatisfy({ $0.entityType == "memories" && $0.uid == uid && $0.deletedAt == nil && $0.payload["profile_uid"]?.string == profileUid }) else { throw CloudError.protocolError }
+        return value
+    }
 }

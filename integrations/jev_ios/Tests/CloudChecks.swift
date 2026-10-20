@@ -39,9 +39,11 @@ struct CloudChecks {
             try historicalPull()
             try keyboardMailboxes()
             try snapshotsAndResults()
+            try evidenceAndMemory()
             try fixtures()
             try await requests()
             try await staleSessionFailure()
+            try await evidenceHistoryIsolation()
             print("PASS: \(count) cloud contract, SQLite, migration and account isolation checks")
         } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
     }
@@ -142,6 +144,109 @@ struct CloudChecks {
             try rejects("Reject unsafe origin \(value)") { _ = try GatewayClient.baseURL(value) }
         }
     }
+    static func evidenceAndMemory() throws {
+        var config = AppConfig(); config.style = "像平时说话"
+        let preferences = config.cloudMergedPreferences(["future_option": .bool(true), "style": .string("旧风格")])
+        try check("Preference save preserves style and unknown server fields", preferences["style"]?.string == "像平时说话" && preferences["future_option"] == .bool(true))
+        config.style = ""
+        try check("Explicit empty style clears saved style", config.cloudMergedPreferences(preferences)["style"]?.string == "")
+        try check("Preference load restores cloud style", try config.applyingCloudPreferences(["style": .string("自然一点")]).style == "自然一点")
+        try check("Cloud count clamps old out-of-range preferences", try config.applyingCloudPreferences(["count": .number(5)]).count == 3)
+        let encoded = try JSONEncoder().encode(AppConfig())
+        var legacy = try JSONDecoder().decode([String: JSONValue].self, from: encoded); legacy.removeValue(forKey: "style")
+        try check("Old keyboard config without style still decodes", try JSONDecoder().decode(AppConfig.self, from: JSONEncoder().encode(legacy)).tone == "稳健")
+        let claim = CloudEvidenceClaim(claimId: "claim", kind: "fact", text: "对方忙", sourceMessageUids: ["m"], sourceQuotes: [.init(messageUid: "m", quote: "这周很忙")], citationStatus: "verified")
+        let message = CloudEvidenceMessage(uid: "m", version: 2, role: "other", text: "我这周很忙，晚点聊", observedAt: "2026-10-21T00:00:00Z", orderKey: "1")
+        var document = CloudEvidenceDocument(analysisId: "a", conversationUid: "c", profileUid: "p", contextRevision: 3, evidence: [claim], messages: [message])
+        try check("Evidence maps exact quote to immutable speaker and time", document.verifiedSources(for: claim).first?.message.role == "other" && document.verifiedSources(for: claim).first?.message.observedAt == "2026-10-21T00:00:00Z")
+        document.messages[0].text = "现在有空"
+        try check("Nonexact evidence never renders a citation", document.verifiedSources(for: claim).isEmpty)
+        let unicodeClaim = CloudEvidenceClaim(claimId: "unicode", kind: "fact", text: "unicode", sourceMessageUids: ["m"], sourceQuotes: [.init(messageUid: "m", quote: "caf\u{00e9}")], citationStatus: "verified")
+        document.messages[0].text = "cafe\u{0301}"
+        try check("Canonical-equivalent text is not an exact source quote", document.verifiedSources(for: unicodeClaim).isEmpty)
+        let oldMessage = try CloudJSON.decoder.decode(CloudEvidenceMessage.self, from: Data(#"{"uid":"legacy","role":"me","text":"原文","observed_at":"2026-10-21","order_key":"1"}"#.utf8))
+        try check("Legacy snapshot without message version remains readable", oldMessage.version == nil)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let db = try CloudDatabase(url: folder.appendingPathComponent("memory.sqlite"))
+        let profile = UUID().uuidString.lowercased(), uid = UUID().uuidString.lowercased(), source = UUID().uuidString.lowercased()
+        let sourceRecord = CloudRecord(entityType: "messages", uid: source, version: 1, createdAt: "", updatedAt: "", deletedAt: nil, payload: ["profile_uid": .string(profile), "confirmed": .bool(true), "text": .string("忙")])
+        let memory = CloudRecord(entityType: "memories", uid: uid, version: 7, createdAt: "", updatedAt: "", deletedAt: nil, payload: ["profile_uid": .string(profile), "text": .string("当前"), "kind": .string("fact"), "status": .string("confirmed"), "source_uids": .array([])])
+        try db.applyPull(.init(serverEpoch: "epoch", changes: [.init(seq: 1, record: record(profile, version: 1, name: "人物")), .init(seq: 2, record: sourceRecord), .init(seq: 3, record: memory)], cursor: "memory", hasMore: false))
+        var manual = CloudMemoryDraft(profileUid: profile, text: "手动记下", kind: "fact", status: "pending", sourceUids: [], changeReason: "主动填写")
+        let newUid = UUID().uuidString.lowercased()
+        try db.saveMemory(uid: newUid, draft: manual)
+        try check("Manual memory queues pending user statement offline", try db.operations().last?.payload["status"]?.string == "pending" && db.operations().last?.payload["source_type"]?.string == "user")
+        var changed = CloudMemoryDraft(record: memory); changed.text = "编辑时看到的版本"; changed.status = "pending"
+        try db.saveMemory(uid: uid, draft: changed, expectedVersion: 5)
+        try check("Editor keeps captured version so concurrent server change conflicts", try db.operations().last?.baseVersion == 5)
+        changed.text = "另一个新内容"; changed.status = "confirmed"
+        try db.saveMemory(uid: uid, draft: changed, expectedVersion: 7)
+        try check("Changing fact content forces a distinct pending review", try db.operations().last?.payload["status"]?.string == "pending")
+        manual.kind = "hypothesis"; manual.status = "confirmed"
+        try rejects("Hypothesis cannot be confirmed") { try db.saveMemory(uid: UUID().uuidString.lowercased(), draft: manual) }
+        manual.status = "pending"; manual.sourceUids = [source]
+        try db.saveMemory(uid: UUID().uuidString.lowercased(), draft: manual)
+        try check("Claim memory stores message sources without trusting source versions", try db.operations().last?.payload["source_type"]?.string == "messages" && db.operations().last?.payload["source_refs"] == nil)
+        manual.profileUid = UUID().uuidString.lowercased()
+        try rejects("Memory cannot cite a different profile") { try db.saveMemory(uid: UUID().uuidString.lowercased(), draft: manual) }
+        var old = memory; old.version = 2; old.payload["text"] = .string("旧内容"); old.payload["status"] = .string("confirmed")
+        try db.restoreMemory(old)
+        let restored = try db.operations().last!
+        try check("History restore creates a new pending revision against current version", restored.baseVersion == 7 && restored.payload["text"]?.string == "旧内容" && restored.payload["status"]?.string == "pending" && restored.payload["change_reason"]?.string == "恢复版本 2")
+        try check("Pending memory remains visibly distinct from server confirmed revision", try db.hasPending(entityType: "memories", uid: uid) && db.remoteRecords("memories").first?.payload["status"]?.string == "confirmed")
+        try db.stage(entityType: "memories", uid: uid, payload: [:], action: "delete")
+        try check("Queued delete immediately hides memory", try !db.memories(profileUid: profile).contains(where: { $0.uid == uid }))
+        var deletedSource = sourceRecord; deletedSource.version = 2; deletedSource.deletedAt = "2026-10-21T01:00:00Z"; deletedSource.payload = [:]
+        try db.applyPull(.init(serverEpoch: "epoch", changes: [.init(seq: 4, record: deletedSource)], cursor: "deleted-source", hasMore: false))
+        var sourcedOld = memory; sourcedOld.payload["source_uids"] = .array([.string(source)])
+        try rejects("History cannot restore a deleted message source") { try db.restoreMemory(sourcedOld) }
+        var deletedMemory = memory; deletedMemory.version = 8; deletedMemory.deletedAt = "2026-10-21T01:00:00Z"; deletedMemory.payload = [:]
+        try db.applyPull(.init(serverEpoch: "epoch", changes: [.init(seq: 5, record: deletedMemory)], cursor: "deleted-memory", hasMore: false))
+        try rejects("History cannot resurrect a deleted memory") { try db.restoreMemory(memory) }
+    }
+    @MainActor
+    static func evidenceHistoryIsolation() async throws {
+        final class Credentials { var value: CloudSession? }
+        let credentials = Credentials()
+        credentials.value = CloudSession(baseUrl: "https://api.zovoeh.cn", token: "a", userId: "owner-a", email: "a@example.com", deviceId: "device-a", deviceSecret: "secret", serverEpoch: "epoch")
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder); CloudURLProtocol.handle = nil }
+        let coordinator = SyncCoordinator(directory: folder, credentials: .init(read: { credentials.value }, save: { credentials.value = $0 }, clear: { credentials.value = nil }), clientFactory: { base in
+            let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [CloudURLProtocol.self]
+            return try GatewayClient(base: base, configuration: config)
+        })
+        try coordinator.restore()
+        let uid = UUID().uuidString.lowercased(), profile = UUID().uuidString.lowercased()
+        var held: CloudURLProtocol?, started: CheckedContinuation<Void, Never>?
+        var seenQuery: [URLQueryItem] = [], headersPresent = false
+        CloudURLProtocol.handle = { connection in
+            Task { @MainActor in
+                if connection.request.url!.path.hasSuffix("/history") {
+                    seenQuery = URLComponents(url: connection.request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                    headersPresent = connection.request.value(forHTTPHeaderField: "X-Device-Session") == "device-a" && connection.request.value(forHTTPHeaderField: "X-Device-Secret") == "secret" && connection.request.value(forHTTPHeaderField: "Authorization") == "Bearer a"
+                    held = connection; started?.resume(); started = nil
+                } else { connection.complete(status: 200, data: Data("{}".utf8)) }
+            }
+        }
+        let oldRead = Task { () -> Bool in
+            do { _ = try await coordinator.memoryHistory(uid: uid, profileUid: profile, beforeVersion: 9); return false }
+            catch is CancellationError { return true }
+            catch { return false }
+        }
+        await withCheckedContinuation { started = $0 }
+        try check("History request sends explicit page cursor and all auth headers", seenQuery.contains(.init(name: "before_version", value: "9")) && seenQuery.contains(.init(name: "limit", value: "50")) && headersPresent)
+        try await coordinator.logout()
+        credentials.value = CloudSession(baseUrl: "https://api.zovoeh.cn", token: "b", userId: "owner-b", email: "b@example.com", deviceId: "device-b", deviceSecret: "b-secret", serverEpoch: "epoch")
+        try coordinator.restore()
+        let page = CloudMemoryHistory(memoryUid: uid, profileUid: profile, versions: [], hasMore: false, nextBeforeVersion: 0)
+        held!.complete(status: 200, data: try CloudJSON.encoder.encode(page))
+        let cancelled = await oldRead.value
+        try check("Late history response cannot expose previous account data", cancelled && coordinator.session?.userId == "owner-b")
+        CloudURLProtocol.handle = { connection in connection.complete(status: 200, data: try! CloudJSON.encoder.encode(CloudMemoryHistory(memoryUid: uid, profileUid: "other-profile", versions: [], hasMore: false, nextBeforeVersion: 0))) }
+        do { _ = try await coordinator.memoryHistory(uid: uid, profileUid: profile); throw CloudCheckError.failed("Cross-profile history must fail") }
+        catch CloudError.protocolError { try check("History response profile checked", true) }
+    }
     static func record(_ uid: String, version: Int, name: String) -> CloudRecord {
         CloudRecord(entityType: "profiles", uid: uid, version: version, createdAt: "2026-10-21T00:00:00Z", updatedAt: "2026-10-21T00:00:00Z", deletedAt: nil,
                     payload: ["name": .string(name), "stage": .string("初识"), "goal": .string("自然接话"), "background": .string(""), "notes": .string("")])
@@ -188,6 +293,8 @@ struct CloudChecks {
     static func snapshotsAndResults() throws {
         let raw = #"{"schema_version":1,"analysis_id":"a","conversation_uid":"c","context_revision":2,"facts":[],"hypotheses":[],"unknowns":[],"strategy":"降压","stop_condition":"停止","candidates":[{"candidate_id":"first","text":"好","reason":null,"weight":null},{"candidate_id":"second","text":"嗯","reason":"接住","weight":null}],"ranking_status":"unavailable","usage":{},"pipeline_version":"cloud-v1"}"#
         let result = try CloudJSON.decoder.decode(CloudAnalysisResult.self, from: Data(raw.utf8))
+        var legacyResult = result; legacyResult.facts = ["旧分析事实"]
+        try check("Legacy claims remain readable with citation explicitly unavailable", legacyResult.displayEvidence.first?.text == "旧分析事实" && legacyResult.displayEvidence.first?.citationStatus == "unavailable")
         try check("Server candidate IDs and order preserved", result.candidates.map(\.candidateId) == ["first", "second"])
         try check("Null weights stay nil", result.advice().candidates.allSatisfy { $0.weight == nil })
         var available = result; available.rankingStatus = "available"; available.candidates[0].weight = 0.6

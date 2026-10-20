@@ -1,0 +1,37 @@
+{
+  "analysis_id": "44444444-4444-4444-8444-444444444444",
+  "conversation_uid": "22222222-2222-4222-8222-222222222222",
+  "profile_uid": "11111111-1111-4111-8111-111111111111",
+  "context_revision": 1,
+  "evidence": [
+    {
+      "claim_id": "fact-1",
+      "kind": "fact",
+      "text": "对方明确给出了一个可用时间。",
+      "source_message_uids": ["33333333-3333-4333-8333-333333333333"],
+      "source_quotes": [{"message_uid": "33333333-3333-4333-8333-333333333333", "quote": "周六下午可以"}],
+      "citation_status": "verified"
+    },
+    {
+      "claim_id": "hypothesis-1",
+      "kind": "hypothesis",
+      "text": "是否愿意赴约仍需结合后续确认。",
+      "source_message_uids": [],
+      "source_quotes": [],
+      "citation_status": "unavailable"
+    }
+  ],
+  "messages": [
+    {
+      "uid": "33333333-3333-4333-8333-333333333333",
+      "version": 1,
+      "profile_uid": "11111111-1111-4111-8111-111111111111",
+      "conversation_uid": "22222222-2222-4222-8222-222222222222",
+      "role": "other",
+      "text": "周六下午可以，我们再确认地点。",
+      "confirmed": true,
+      "observed_at": "2026-10-21T00:00:00Z",
+      "order_key": "000001"
+    }
+  ]
+}

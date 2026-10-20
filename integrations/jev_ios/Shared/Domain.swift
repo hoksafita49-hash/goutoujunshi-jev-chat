@@ -54,11 +54,13 @@ struct AppConfig: Codable, Equatable {
     var tone = "稳健"
     var length = "简短"
     var count = 3
+    // Optional so configurations and keyboard handoffs from v1 keep decoding.
+    var style: String? = nil
     var maxCharacters: Int { ["简短": 40, "适中": 70, "详细": 100][length] ?? 40 }
 
     func validate() throws {
         guard ["稳健", "会撩", "直接"].contains(tone), ["简短", "适中", "详细"].contains(length),
-              (1...3).contains(count), !deepseekModel.trimmed.isEmpty,
+              (1...3).contains(count), (style ?? "").count <= 500, !deepseekModel.trimmed.isEmpty,
               !openrouterModel.trimmed.isEmpty, !jevModel.trimmed.isEmpty,
               [deepseekModel, openrouterModel, visionModel, jevModel].allSatisfy({ $0.count <= 160 }) else {
             throw GoutouError.invalid("请核对模型 ID、口吻、长度和候选数量")

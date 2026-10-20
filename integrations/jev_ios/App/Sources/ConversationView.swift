@@ -30,6 +30,7 @@ struct ConversationView: View {
                             }
                         }
                         Button("立即同步") { model.syncCloud() }
+                        NavigationLink("查看与管理当前人物记忆") { CloudMemoryView().id(model.cloudReviewIdentity + model.relationship.id) }
                     }.card()
                 }
                 VStack(alignment: .leading, spacing: 8) {
@@ -112,6 +113,9 @@ struct ConversationView: View {
                         Button("详细分析") { details = true }.accessibilityIdentifier("detailsButton")
                     }.buttonStyle(.bordered)
                     if model.cloudEnabled {
+                        Button("查看分析依据与原文引用") { model.openCloudEvidence() }.disabled(model.cloudReviewBusy || model.cloudContext?.result == nil)
+                        if model.cloudReviewBusy { ProgressView("读取依据…") }
+                        if !model.cloudReviewStatus.isEmpty { Text(model.cloudReviewStatus).font(.footnote).textSelection(.enabled) }
                         Button("请求云端详细解释") { model.analyzeCloud(kind: "explanation") }.disabled(model.working || model.demo)
                         if !model.cloudExplanation.isEmpty { Text(model.cloudExplanation).textSelection(.enabled).card() }
                     }
@@ -125,6 +129,7 @@ struct ConversationView: View {
         }
         .background(Palette.cream)
         .sheet(isPresented: $shortcutGuide) { ScreenshotShortcutGuide() }
+        .sheet(item: $model.cloudEvidence, onDismiss: { model.closeCloudReview() }) { document in NavigationStack { CloudEvidenceView(document: document) } }
         .sheet(isPresented: $details) {
             if let advice = model.advice { NavigationStack { DetailView(advice: advice, transcript: model.transcript) } }
         }

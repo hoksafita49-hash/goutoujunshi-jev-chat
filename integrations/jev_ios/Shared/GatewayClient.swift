@@ -89,4 +89,12 @@ final class GatewayClient {
         guard UUID(uuidString: id) != nil else { throw CloudError.protocolError }
         return try await call(CloudJob.self, path: "/v1/analyses/" + id)
     }
+    func evidence(_ id: String) async throws -> CloudEvidenceDocument {
+        guard UUID(uuidString: id) != nil else { throw CloudError.protocolError }
+        return try await call(CloudEvidenceDocument.self, path: "/v1/analyses/" + id + "/evidence")
+    }
+    func memoryHistory(_ uid: String, beforeVersion: Int = 0) async throws -> CloudMemoryHistory {
+        guard UUID(uuidString: uid) != nil, beforeVersion >= 0 else { throw CloudError.protocolError }
+        return try await call(CloudMemoryHistory.self, path: "/v1/memories/" + uid + "/history", query: [.init(name: "before_version", value: String(beforeVersion)), .init(name: "limit", value: "50")])
+    }
 }

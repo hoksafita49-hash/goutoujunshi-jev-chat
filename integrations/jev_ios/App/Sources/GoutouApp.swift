@@ -80,6 +80,16 @@ final class AppModel: ObservableObject {
     @Published var cloudRecovery = false
     @Published var cloudContext: CloudContext?
     @Published var cloudExplanation = ""
+    @Published var cloudMemories = [CloudRecord]()
+    @Published var cloudPendingMemoryUids = Set<String>()
+    @Published var cloudReviewIdentity = ""
+    @Published var cloudEvidence: CloudEvidenceDocument?
+    @Published var cloudHistoryMemory: CloudRecord?
+    @Published var cloudHistoryVersions = [CloudRecord]()
+    @Published var cloudHistoryBefore = 0
+    @Published var cloudHistoryMore = false
+    @Published var cloudReviewBusy = false
+    @Published var cloudReviewStatus = ""
     let transport = HTTPTransport()
     var store: GoutouStore?
     var cloud: SyncCoordinator?
@@ -87,6 +97,8 @@ final class AppModel: ObservableObject {
     var cloudManualTask: Task<Void, Never>?
     var task: Task<Void, Never>?
     var revision = 0
+    var cloudReviewGeneration = UUID()
+    var cloudReviewTask: Task<Void, Never>?
 
     init() {
         do {

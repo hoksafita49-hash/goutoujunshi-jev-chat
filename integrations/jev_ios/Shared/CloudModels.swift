@@ -84,7 +84,18 @@ struct CloudPendingJob: Codable, Identifiable {
     var id: String { requestId }
 }
 extension AppConfig {
-    var cloudPreferences: [String: JSONValue] { ["tone": .string(tone), "length": .string(length), "count": .number(Double(count)), "style": .string("")] }
+    var cloudPreferences: [String: JSONValue] { ["tone": .string(tone), "length": .string(length), "count": .number(Double(min(3, max(1, count)))), "style": .string(style ?? "")] }
+    func cloudMergedPreferences(_ existing: [String: JSONValue]) -> [String: JSONValue] {
+        existing.merging(cloudPreferences) { _, chosen in chosen }
+    }
+    func applyingCloudPreferences(_ value: [String: JSONValue]) throws -> AppConfig {
+        var updated = self
+        if let tone = value["tone"]?.string { updated.tone = tone }
+        if let length = value["length"]?.string { updated.length = length }
+        if let count = value["count"]?.int { updated.count = min(3, max(1, count)) }
+        if let style = value["style"]?.string { updated.style = style }
+        try updated.validate(); return updated
+    }
 }
 struct CloudJob: Codable {
     struct JobError: Codable { var code: String }
@@ -96,6 +107,13 @@ struct CloudAnalysisResult: Codable, Equatable {
     var schemaVersion: Int; var analysisId: String; var conversationUid: String; var contextRevision: Int
     var facts: [String]; var hypotheses: [String]; var unknowns: [String]; var strategy: String; var stopCondition: String
     var candidates: [CandidateRow]; var rankingStatus: String; var usage: [String: JSONValue]; var pipelineVersion: String; var text: String?
+    var evidence: [CloudEvidenceClaim]? = nil
+    var displayEvidence: [CloudEvidenceClaim] {
+        if let evidence = evidence, !evidence.isEmpty { return evidence }
+        return [("fact", facts), ("hypothesis", hypotheses), ("unknown", unknowns)].flatMap { kind, rows in
+            rows.enumerated().map { index, text in CloudEvidenceClaim(claimId: "legacy-\(kind)-\(index)", kind: kind, text: text, sourceMessageUids: [], sourceQuotes: [], citationStatus: "unavailable") }
+        }
+    }
     func matches(conversationUid: String, revision: Int) -> Bool { self.conversationUid == conversationUid && contextRevision == revision }
     func advice() -> Advice {
         Advice(support: text ?? "服务端统一分析", intent: "请结合可见事实判断，未知保持未知。", intentConfidence: nil,
@@ -115,4 +133,63 @@ struct CloudSnapshot: Codable {
     var accountKey: String; var profiles: [Relationship]; var contexts: [CloudContext]; var selectedProfileUid: String?
     var createdAt = Date()
     func belongs(to key: String) -> Bool { accountKey == key }
+}
+
+struct CloudEvidenceClaim: Codable, Equatable, Identifiable {
+    struct Quote: Codable, Equatable { var messageUid: String; var quote: String }
+    var claimId: String; var kind: String; var text: String
+    var sourceMessageUids: [String]; var sourceQuotes: [Quote]; var citationStatus: String
+    var id: String { claimId }
+    var kindLabel: String { kind == "fact" ? "事实" : kind == "hypothesis" ? "推测" : "未知" }
+}
+struct CloudEvidenceMessage: Codable, Equatable {
+    var uid: String; var version: Int?; var role: String; var text: String; var observedAt: String; var orderKey: String
+    var speaker: String { role == "me" ? "我" : role == "other" ? "对方" : "身份未确认" }
+}
+struct CloudEvidenceSource: Identifiable {
+    var message: CloudEvidenceMessage; var quote: String
+    var id: String { message.uid + ":" + quote }
+}
+struct CloudEvidenceDocument: Codable, Identifiable {
+    var analysisId: String; var conversationUid: String; var profileUid: String; var contextRevision: Int
+    var evidence: [CloudEvidenceClaim]; var messages: [CloudEvidenceMessage]
+    var id: String { analysisId }
+    func verifiedSources(for claim: CloudEvidenceClaim) -> [CloudEvidenceSource] {
+        guard claim.citationStatus == "verified" else { return [] }
+        var seen = Set<String>()
+        return claim.sourceQuotes.compactMap { source in
+            guard !source.quote.isEmpty, claim.sourceMessageUids.contains(source.messageUid),
+                  let message = messages.first(where: { $0.uid == source.messageUid }), Data(message.text.utf8).range(of: Data(source.quote.utf8)) != nil,
+                  seen.insert(source.messageUid + ":" + source.quote).inserted else { return nil }
+            return CloudEvidenceSource(message: message, quote: source.quote)
+        }
+    }
+}
+struct CloudMemoryHistory: Codable {
+    var memoryUid: String; var profileUid: String; var versions: [CloudRecord]; var hasMore: Bool; var nextBeforeVersion: Int
+}
+struct CloudMemoryDraft {
+    var profileUid: String; var text: String; var kind = "fact"; var status = "pending"
+    var sourceUids = [String](); var changeReason = ""
+    init(profileUid: String, text: String = "", kind: String = "fact", status: String = "pending", sourceUids: [String] = [], changeReason: String = "") {
+        self.profileUid = profileUid; self.text = text; self.kind = kind; self.status = status; self.sourceUids = sourceUids; self.changeReason = changeReason
+    }
+    init(record: CloudRecord) {
+        profileUid = record.payload["profile_uid"]?.string ?? ""; text = record.payload["text"]?.string ?? ""
+        kind = record.payload["kind"]?.string ?? "hypothesis"; status = record.payload["status"]?.string ?? "pending"
+        if let source = record.payload["source_uids"], case .array(let values) = source { sourceUids = values.compactMap(\.string) }
+    }
+    func payload(preserving existing: [String: JSONValue] = [:]) throws -> [String: JSONValue] {
+        guard !text.trimmed.isEmpty, text.count <= 4000, changeReason.count <= 500,
+              ["fact", "hypothesis"].contains(kind), ["pending", "confirmed"].contains(status),
+              !(kind == "hypothesis" && status == "confirmed"), Set(sourceUids).count <= 16 else {
+            throw GoutouError.invalid("记忆正文须为 1–4000 字，原因最多 500 字；推测须先明确改为事实，才可确认。")
+        }
+        var value = existing
+        value["profile_uid"] = .string(profileUid); value["text"] = .string(text); value["kind"] = .string(kind); value["status"] = .string(status)
+        value["source_uids"] = .array(Array(Set(sourceUids)).sorted().map(JSONValue.string))
+        value["source_type"] = .string(sourceUids.isEmpty ? "user" : "messages"); value["change_reason"] = .string(changeReason)
+        value.removeValue(forKey: "source_refs") // Only the server may establish source versions.
+        return value
+    }
 }

@@ -3,6 +3,7 @@ import Foundation
 @MainActor
 extension AppModel {
     func setCloudEnabled(_ enabled: Bool) {
+        closeCloudReview()
         invalidate(clear: true); transcript = ""; cloudContext = nil; confirmed = false
         store?.cloudEnabled = enabled; cloudEnabled = enabled; reload()
         if enabled { var local = config; local.ocr = .local; try? store?.saveConfig(local); foreground() }
@@ -26,27 +27,36 @@ extension AppModel {
         do {
             if let current = cloud?.session, try SessionVault.read()?.deviceId != current.deviceId { try cloud?.requireLogin() }
             guard let cloud = cloud, let session = cloud.session, let db = cloud.database else {
+                closeCloudReview(); cloudReviewIdentity = ""; cloudMemories = []; cloudPendingMemoryUids = []
                 cloudEmail = ""; cloudProfiles = []; cloudContexts = []; cloudConflicts = []; cloudPendingJobs = []
                 relationship = Relationship(id: "cloud-empty", label: "请先登录并选择人物")
                 cloudContext = nil; advice = nil; transcript = ""; cloudStatus = cloud?.status ?? "需登录"
                 return
+            }
+            let identity = session.accountKey + ":" + session.deviceId
+            if cloudReviewIdentity != identity {
+                closeCloudReview(); cloudReviewIdentity = identity; config = AppConfig(); config.ocr = .local
+                if store?.config() != config { try store?.saveConfig(config) }
             }
             cloudEmail = session.email; cloudStatus = cloud.status
             cloudRecovery = try db.recoveryRequired()
             cloudProfiles = try db.visibleRecords("profiles").map(\.relationship)
             cloudContexts = try db.contexts(); cloudConflicts = try db.conflicts(); cloudPendingJobs = try db.pendingJobs()
             if let preferences = try db.visibleRecords("preferences").first?.payload {
-                var updated = config
-                if let value = preferences["tone"]?.string { updated.tone = value }
-                if let value = preferences["length"]?.string { updated.length = value }
-                if let value = preferences["count"]?.int { updated.count = value }
-                if (try? updated.validate()) != nil { config = updated }
+                if let updated = try? config.applyingCloudPreferences(preferences) {
+                    config = updated
+                    if store?.config() != updated { try store?.saveConfig(updated) }
+                }
             }
             let selected = try cloud.selectedProfile()
             if let profile = cloudProfiles.first(where: { $0.id == selected }) ?? cloudProfiles.first {
-                if profile.id != relationship.id { invalidate(clear: true); transcript = ""; cloudContext = nil }
+                if profile.id != relationship.id { closeCloudReview(); invalidate(clear: true); transcript = ""; cloudContext = nil }
                 relationship = profile
-            } else { relationship = Relationship(id: "cloud-empty", label: "先新建或导入人物") }
+            } else { closeCloudReview(); relationship = Relationship(id: "cloud-empty", label: "先新建或导入人物") }
+            cloudMemories = try db.memories(profileUid: relationship.id)
+            cloudPendingMemoryUids = Set(try db.operations().filter { $0.entityType == "memories" }.map(\.entityUid))
+            if let history = cloudHistoryMemory, !cloudMemories.contains(where: { $0.uid == history.uid }) { closeCloudReview() }
+            if let evidence = cloudEvidence, try db.remoteRecords("analyses").contains(where: { $0.uid == evidence.analysisId && $0.deletedAt != nil }) { closeCloudReview() }
             if let current = cloudContext, let updated = cloudContexts.first(where: { $0.id == current.id && $0.contextRevision == current.contextRevision }) {
                 cloudContext = updated
                 if !working, let result = updated.result { advice = result.advice() }
@@ -72,7 +82,8 @@ extension AppModel {
     func logoutCloud() {
         guard !cloudBusy else { return }
         cloudManualTask?.cancel(); cloudManualTask = nil
-        cloudBusy = true; background(); invalidate(clear: true); transcript = ""; cloudContext = nil
+        cloudBusy = true; closeCloudReview(); cloudReviewIdentity = ""; cloudMemories = []; cloudPendingMemoryUids = []
+        background(); invalidate(clear: true); transcript = ""; cloudContext = nil
         store?.clearHandoff(); store?.clearKeyboardSession(); store?.captureMailbox.clear()
         Task {
             defer { cloudBusy = false; refreshCloudView() }
@@ -115,6 +126,7 @@ extension AppModel {
     }
     func selectCloudProfile(_ profile: Relationship) {
         do {
+            closeCloudReview()
             invalidate(clear: true); transcript = ""; cloudContext = nil
             try cloud?.select(profile.id); refreshCloudView()
         } catch { status = error.localizedDescription }
@@ -153,13 +165,87 @@ extension AppModel {
     }
     func openCloudContext(_ context: CloudContext) {
         guard context.profileUid == relationship.id else { return }
+        closeCloudReview()
         invalidate(clear: true); transcript = context.transcript; confirmed = true; cloudContext = context
         advice = context.result?.advice(); source = "云端已确认聊天"
     }
     func saveCloudPreferences(_ config: AppConfig) throws {
-        guard let db = cloud?.database else { throw CloudError.signIn }
-        try db.stage(entityType: "preferences", uid: "00000000-0000-4000-8000-000000000001", payload: ["tone": .string(config.tone), "length": .string(config.length), "count": .number(Double(config.count)), "style": .string("")])
+        try config.validate()
+        guard let db = cloud?.database, cloud?.session != nil else { throw CloudError.signIn }
+        let existing = try db.visibleRecords("preferences").first?.payload ?? [:]
+        try db.stage(entityType: "preferences", uid: "00000000-0000-4000-8000-000000000001", payload: config.cloudMergedPreferences(existing))
         syncCloud()
+    }
+    func closeCloudReview() {
+        cloudReviewGeneration = UUID(); cloudReviewTask?.cancel(); cloudReviewTask = nil
+        cloudEvidence = nil; cloudHistoryMemory = nil; cloudHistoryVersions = []; cloudHistoryBefore = 0; cloudHistoryMore = false
+        cloudReviewBusy = false; cloudReviewStatus = ""
+    }
+    func openCloudEvidence() {
+        guard let context = cloudContext, context.profileUid == relationship.id, let analysisId = context.result?.analysisId, let cloud = cloud else { return }
+        closeCloudReview(); let generation = cloudReviewGeneration, identity = cloudReviewIdentity, profile = relationship.id
+        cloudReviewBusy = true; cloudReviewStatus = "正在读取原始分析依据…"
+        cloudReviewTask = Task {
+            do {
+                let document = try await cloud.evidence(analysisId: analysisId, context: context)
+                guard !Task.isCancelled, cloudReviewGeneration == generation, cloudReviewIdentity == identity, relationship.id == profile else { return }
+                cloudEvidence = document; cloudReviewBusy = false; cloudReviewStatus = ""
+            } catch {
+                guard !Task.isCancelled, cloudReviewGeneration == generation, cloudReviewIdentity == identity, relationship.id == profile else { return }
+                cloudReviewBusy = false; cloudReviewStatus = "依据暂不可读取（需联网，原始上下文可能已删除）：" + error.localizedDescription
+            }
+        }
+    }
+    func saveCloudMemory(uid: String, draft: CloudMemoryDraft, expectedVersion: Int?, identity: String) throws {
+        guard identity == cloudReviewIdentity, !identity.isEmpty, draft.profileUid == relationship.id,
+              let db = cloud?.database, cloud?.session != nil else { throw CloudError.signIn }
+        try db.saveMemory(uid: uid, draft: draft, expectedVersion: expectedVersion)
+        refreshCloudView(); syncCloud()
+    }
+    func saveCloudClaim(_ claim: CloudEvidenceClaim, document: CloudEvidenceDocument) throws {
+        guard document.profileUid == relationship.id, cloudEvidence?.analysisId == document.analysisId, let db = cloud?.database else { throw CloudError.signIn }
+        let live = try db.visibleRecords("messages").filter { $0.payload["profile_uid"]?.string == document.profileUid && $0.payload["confirmed"] == .bool(true) }
+        let sources = document.verifiedSources(for: claim).map { $0.message.uid }.filter { uid in live.contains { $0.uid == uid } }
+        let draft = CloudMemoryDraft(profileUid: document.profileUid, text: claim.text, kind: claim.kind == "fact" ? "fact" : "hypothesis", sourceUids: Array(Set(sources)), changeReason: "从分析依据主动保存")
+        try saveCloudMemory(uid: UUID().uuidString.lowercased(), draft: draft, expectedVersion: 0, identity: cloudReviewIdentity)
+    }
+    func setCloudMemoryStatus(_ memory: CloudRecord, status: String, identity: String) throws {
+        var draft = CloudMemoryDraft(record: memory); draft.status = status
+        draft.changeReason = status == "confirmed" ? "用户明确确认事实" : "用户退回待确认"
+        try saveCloudMemory(uid: memory.uid, draft: draft, expectedVersion: memory.version, identity: identity)
+    }
+    func deleteCloudMemory(_ memory: CloudRecord, identity: String) throws {
+        guard identity == cloudReviewIdentity, !identity.isEmpty, memory.payload["profile_uid"]?.string == relationship.id,
+              let db = cloud?.database, cloud?.session != nil else { throw CloudError.signIn }
+        try db.stage(entityType: "memories", uid: memory.uid, payload: [:], action: "delete", baseVersion: memory.version)
+        refreshCloudView(); syncCloud()
+    }
+    func openCloudHistory(_ memory: CloudRecord) {
+        guard memory.payload["profile_uid"]?.string == relationship.id else { return }
+        closeCloudReview(); cloudHistoryMemory = memory; loadCloudHistory()
+    }
+    func loadCloudHistory() {
+        guard !cloudReviewBusy, let memory = cloudHistoryMemory, let cloud = cloud else { return }
+        let generation = cloudReviewGeneration, identity = cloudReviewIdentity, profile = relationship.id, before = cloudHistoryBefore
+        cloudReviewBusy = true; cloudReviewStatus = ""
+        cloudReviewTask = Task {
+            do {
+                let page = try await cloud.memoryHistory(uid: memory.uid, profileUid: profile, beforeVersion: before)
+                guard !Task.isCancelled, cloudReviewGeneration == generation, cloudReviewIdentity == identity, relationship.id == profile else { return }
+                let known = Set(cloudHistoryVersions.map(\.version))
+                cloudHistoryVersions += page.versions.filter { !known.contains($0.version) }
+                cloudHistoryBefore = page.nextBeforeVersion; cloudHistoryMore = page.hasMore; cloudReviewBusy = false
+            } catch {
+                guard !Task.isCancelled, cloudReviewGeneration == generation, cloudReviewIdentity == identity, relationship.id == profile else { return }
+                if case CloudError.http(404, _) = error { cloudHistoryVersions = []; cloudHistoryMore = false }
+                cloudReviewBusy = false; cloudReviewStatus = "历史需要联网；已删除的记忆无法恢复：" + error.localizedDescription
+            }
+        }
+    }
+    func restoreCloudMemory(_ version: CloudRecord, identity: String) throws {
+        guard identity == cloudReviewIdentity, !identity.isEmpty, version.payload["profile_uid"]?.string == relationship.id,
+              version.uid == cloudHistoryMemory?.uid, let db = cloud?.database, cloud?.session != nil else { throw CloudError.signIn }
+        try db.restoreMemory(version); closeCloudReview(); refreshCloudView(); syncCloud()
     }
     func analyzeCloud(kind: String) {
         guard !working else { return }
