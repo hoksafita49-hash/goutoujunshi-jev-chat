@@ -211,7 +211,7 @@ struct CloudMemoryHistoryView: View {
         do {
             if let version = restoring { try model.restoreCloudMemory(version, identity: identity) }
             dismiss()
-        } catch { error = error.localizedDescription }
+        } catch { self.error = error.localizedDescription }
         restoring = nil
     }
 }
