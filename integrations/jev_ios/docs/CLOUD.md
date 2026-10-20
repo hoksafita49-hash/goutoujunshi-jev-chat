@@ -24,4 +24,4 @@
 
 `bash tools/check.sh` 在 macOS 上运行既有核心/打字/图片检查和新增 `Tests/CloudChecks.swift`，包含共用 `contracts/fixtures/`、GET/202/401、账号隔离、SQLite 冲突/墓碑、迁移去重与重复短消息检查。`python tools/check_project.py` 在 Windows 也可检查工程生成结果、SQLite 链接和扩展文件归属；它不能替代 Swift 类型检查。
 
-`.github/workflows/ios-build.yml` 的 macOS runner 执行上述检查和模拟器/未签名设备构建。该 workflow 只提供模拟器开发 ZIP，不能安装到 iPhone。本阶段未提供签名凭据、TestFlight 发布或真机验收；需在远程 macOS/Xcode 构建成功后继续完成 Apple 签名与个人 iPhone 验收。
+`.github/workflows/ios-build.yml` 的 macOS runner 执行上述检查和模拟器/未签名设备构建。该 workflow 只提供模拟器开发 ZIP，不能安装到 iPhone。2026-10-21 已完成 274 项实际运行检查及两个 target 构建，见[构建记录](BUILD_CLOUD_V1.md)。本阶段未提供签名凭据、TestFlight 发布或真机验收；下一步需完成 Apple 签名与个人 iPhone 验收。
