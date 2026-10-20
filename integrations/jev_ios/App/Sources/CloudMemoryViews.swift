@@ -25,6 +25,10 @@ struct CloudMemoryView: View {
                     Button("编辑或纠正") { editing = memory }
                     if memory.payload["kind"]?.string == "fact", memory.payload["status"]?.string != "confirmed" {
                         Button("明确确认为事实") { confirming = memory }
+                            .disabled(model.cloudPendingMemoryUids.contains(memory.uid))
+                        if model.cloudPendingMemoryUids.contains(memory.uid) {
+                            Text("请先同步新增或更正，再单独确认。").font(.caption)
+                        }
                     }
                     if memory.payload["status"]?.string == "confirmed" {
                         Button("退回待确认") { perform { try model.setCloudMemoryStatus(memory, status: "pending", identity: identity) } }

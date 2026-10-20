@@ -113,6 +113,9 @@ final class CloudDatabase {
             if previous == nil || previous?.text != draft.text || previous?.kind != draft.kind || Set(previous?.sourceUids ?? []) != Set(draft.sourceUids) { reviewed.status = "pending" }
             // Validate the user's original request before applying the pending rule.
             _ = try draft.payload()
+            if reviewed.status == "confirmed", try hasPending(entityType: "memories", uid: uid) {
+                throw GoutouError.invalid("先同步这条记忆的新增或更正，再单独确认事实。")
+            }
             try stageInside(entityType: "memories", uid: uid, payload: reviewed.payload(preserving: existing?.payload ?? [:]), baseVersion: expectedVersion)
         }
     }

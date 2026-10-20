@@ -184,6 +184,11 @@ struct CloudChecks {
         changed.text = "另一个新内容"; changed.status = "confirmed"
         try db.saveMemory(uid: uid, draft: changed, expectedVersion: 7)
         try check("Changing fact content forces a distinct pending review", try db.operations().last?.payload["status"]?.string == "pending")
+        var confirmation = changed
+        confirmation.status = "confirmed"
+        try rejects("Queued correction must sync before a separate fact confirmation") {
+            try db.saveMemory(uid: uid, draft: confirmation, expectedVersion: 7)
+        }
         manual.kind = "hypothesis"; manual.status = "confirmed"
         try rejects("Hypothesis cannot be confirmed") { try db.saveMemory(uid: UUID().uuidString.lowercased(), draft: manual) }
         manual.status = "pending"; manual.sourceUids = [source]
