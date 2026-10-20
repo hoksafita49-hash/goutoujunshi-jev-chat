@@ -40,6 +40,7 @@ struct CloudChecks {
             try keyboardMailboxes()
             try snapshotsAndResults()
             try evidenceAndMemory()
+            try crossPlatformPreferences()
             try fixtures()
             try await requests()
             try await staleSessionFailure()
@@ -204,6 +205,28 @@ struct CloudChecks {
         var deletedMemory = memory; deletedMemory.version = 8; deletedMemory.deletedAt = "2026-10-21T01:00:00Z"; deletedMemory.payload = [:]
         try db.applyPull(.init(serverEpoch: "epoch", changes: [.init(seq: 5, record: deletedMemory)], cursor: "deleted-memory", hasMore: false))
         try rejects("History cannot resurrect a deleted memory") { try db.restoreMemory(memory) }
+    }
+    static func crossPlatformPreferences() throws {
+        let rows: [(String, String, Int, Int)] = [("自然", "适中", 2, 501), ("natural", "short", 1, 4000)]
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "goutou-cloud-preferences-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = GoutouStore(defaults: defaults, container: directory)
+        for (tone, length, count, styleLength) in rows {
+            let style = String(repeating: "a", count: styleLength)
+            let payload: [String: JSONValue] = ["tone": .string(tone), "length": .string(length), "count": .number(Double(count)), "style": .string(style), "future": .string("keep")]
+            let loaded = try AppConfig().applyingCloudPreferences(payload)
+            try check("Cross-platform cloud preferences preserve custom text and complete style \(tone)", loaded.tone == tone && loaded.length == length && loaded.count == count && loaded.style == style)
+            try store.saveConfig(loaded)
+            try check("Shared keyboard storage preserves accepted cloud preferences \(tone)", store.config() == loaded)
+            let saved = loaded.cloudMergedPreferences(payload)
+            try check("Cross-platform preference round trip retains all chosen and unknown fields \(tone)", saved == payload)
+        }
+        try rejects("Style above cloud 4000-character bound is rejected") { _ = try AppConfig().applyingCloudPreferences(["style": .string(String(repeating: "a", count: 4001))]) }
+        try rejects("Oversized cloud tone remains bounded") { _ = try AppConfig().applyingCloudPreferences(["tone": .string(String(repeating: "a", count: 201))]) }
+        try rejects("Direct mode still requires valid model IDs") { var invalid = AppConfig(); invalid.deepseekModel = ""; try invalid.validate() }
     }
     @MainActor
     static func evidenceHistoryIsolation() async throws {

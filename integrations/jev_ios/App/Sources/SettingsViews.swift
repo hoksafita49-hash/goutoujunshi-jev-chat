@@ -58,11 +58,11 @@ struct ProviderView: View {
                 }
             }
             Section("回复偏好") {
-                Picker("口吻", selection: $draft.tone) { ForEach(["稳健", "会撩", "直接"], id: \.self) { Text($0).tag($0) } }
-                Picker("长度", selection: $draft.length) { ForEach(["简短", "适中", "详细"], id: \.self) { Text($0).tag($0) } }
+                Picker("口吻", selection: $draft.tone) { ForEach(preferenceChoices(["稳健", "会撩", "直接"], selected: draft.tone), id: \.self) { Text($0.isEmpty ? "未指定" : $0).tag($0) } }
+                Picker("长度", selection: $draft.length) { ForEach(preferenceChoices(["简短", "适中", "详细"], selected: draft.length), id: \.self) { Text($0.isEmpty ? "未指定" : $0).tag($0) } }
                 Stepper("最多 \(draft.count) 条候选", value: $draft.count, in: 1...3)
                 TextField("我的表达风格（选填）", text: Binding(get: { draft.style ?? "" }, set: { draft.style = $0 }), axis: .vertical).lineLimit(2...5)
-                Text("例如：自然、少用表情。清空后保存可移除已有风格。最多 500 字。") .font(.caption).foregroundStyle(Palette.secondary)
+                Text("例如：自然、少用表情。清空后保存可移除已有风格。最多 4000 字；保留其他设备填写的口吻和长度。") .font(.caption).foregroundStyle(Palette.secondary)
             }
             Section {
                 Button("保存并应用配置") { save() }.buttonStyle(BrandPrimaryButtonStyle())
@@ -88,6 +88,9 @@ struct ProviderView: View {
 
     private func cancelTest() {
         testRevision += 1; testTask?.cancel(); testTask = nil; testing = false
+    }
+    private func preferenceChoices(_ presets: [String], selected: String) -> [String] {
+        presets.contains(selected) ? presets : presets + [selected]
     }
     private func modelField(_ title: String, value: Binding<String>) -> some View {
         TextField(title, text: value).textInputAutocapitalization(.never).autocorrectionDisabled()

@@ -59,11 +59,13 @@ struct AppConfig: Codable, Equatable {
     var maxCharacters: Int { ["简短": 40, "适中": 70, "详细": 100][length] ?? 40 }
 
     func validate() throws {
-        guard ["稳健", "会撩", "直接"].contains(tone), ["简短", "适中", "详细"].contains(length),
-              (1...3).contains(count), (style ?? "").count <= 500, !deepseekModel.trimmed.isEmpty,
+        // Cloud preferences are free text across clients. Keep their accepted
+        // values intact while still bounding direct-mode requests and models.
+        guard tone.utf16.count <= 200, length.utf16.count <= 200,
+              (1...3).contains(count), (style ?? "").utf16.count <= 4000, !deepseekModel.trimmed.isEmpty,
               !openrouterModel.trimmed.isEmpty, !jevModel.trimmed.isEmpty,
               [deepseekModel, openrouterModel, visionModel, jevModel].allSatisfy({ $0.count <= 160 }) else {
-            throw GoutouError.invalid("请核对模型 ID、口吻、长度和候选数量")
+            throw GoutouError.invalid("请核对模型 ID、口吻与长度（各最多 200 字）、风格（最多 4000 字）和候选数量")
         }
         if ocr == .openrouter && visionModel.trimmed.isEmpty {
             throw GoutouError.invalid("OpenRouter 识图需要单独填写支持图片输入的模型 ID")

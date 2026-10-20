@@ -125,22 +125,7 @@ struct CloudEvidenceView: View {
                 Text("上下文版本 \(document.contextRevision)") .font(.caption)
             }
             ForEach(document.evidence) { claim in
-                Section(claim.kindLabel) {
-                    Text(claim.text).textSelection(.enabled)
-                    let sources = document.verifiedSources(for: claim)
-                    if sources.isEmpty { Text("引用不可用：旧分析或缺少可核实的原文引用。") .font(.caption).foregroundStyle(Palette.secondary) }
-                    ForEach(sources) { source in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("“" + source.quote + "”").textSelection(.enabled)
-                            Text(source.message.speaker + " · " + source.message.observedAt + " · 消息版本 " + (source.message.version.map(String.init) ?? "未知")) .font(.caption).foregroundStyle(Palette.secondary)
-                        }
-                    }
-                    Button(saved.contains(claim.id) ? "已保存为待确认记忆" : "主动保存为待确认记忆") {
-                        do { try model.saveCloudClaim(claim, document: document); saved.insert(claim.id); message = "已加入待确认记忆；可在人物记忆中编辑和核实。" }
-                        catch { message = error.localizedDescription }
-                    }.disabled(saved.contains(claim.id))
-                    if sources.isEmpty { Text("无可用消息引用时，按用户主动保存的陈述记录。") .font(.caption) }
-                }
+                CloudEvidenceClaimSection(claim: claim, sources: document.verifiedSources(for: claim), saved: saved.contains(claim.id)) { save(claim) }
             }
             if document.evidence.isEmpty { Text("此分析没有可显示的依据。") }
             if !message.isEmpty { Text(message).font(.footnote) }
@@ -149,6 +134,44 @@ struct CloudEvidenceView: View {
         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { model.closeCloudReview(); dismiss() } } }
         .onChange(of: model.cloudReviewIdentity) { _ in dismiss() }
         .onChange(of: model.relationship.id) { _ in dismiss() }
+    }
+    private func save(_ claim: CloudEvidenceClaim) {
+        do {
+            try model.saveCloudClaim(claim, document: document)
+            saved.insert(claim.id); message = "已加入待确认记忆；可在人物记忆中编辑和核实。"
+        } catch { message = error.localizedDescription }
+    }
+}
+
+private struct CloudEvidenceClaimSection: View {
+    let claim: CloudEvidenceClaim
+    let sources: [CloudEvidenceSource]
+    let saved: Bool
+    let onSave: () -> Void
+    var body: some View {
+        Section(claim.kindLabel) {
+            Text(claim.text).textSelection(.enabled)
+            if sources.isEmpty {
+                Text("引用不可用：旧分析或缺少可核实的原文引用。").font(.caption).foregroundStyle(Palette.secondary)
+            }
+            ForEach(sources) { source in CloudEvidenceSourceRow(source: source) }
+            Button(saved ? "已保存为待确认记忆" : "主动保存为待确认记忆", action: onSave).disabled(saved)
+            if sources.isEmpty { Text("无可用消息引用时，按用户主动保存的陈述记录。").font(.caption) }
+        }
+    }
+}
+
+private struct CloudEvidenceSourceRow: View {
+    let source: CloudEvidenceSource
+    private var metadata: String {
+        let version = source.message.version.map { String($0) } ?? "未知"
+        return "\(source.message.speaker) · \(source.message.observedAt) · 消息版本 \(version)"
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("“\(source.quote)”").textSelection(.enabled)
+            Text(metadata).font(.caption).foregroundStyle(Palette.secondary)
+        }
     }
 }
 
@@ -162,12 +185,7 @@ struct CloudMemoryHistoryView: View {
         List {
             Section { Text("从新到旧显示服务器历史。恢复会创建一个新的待确认修订，使用当前版本作为更新基础；消息来源在保存时重新校验。") .font(.caption) }
             ForEach(model.cloudHistoryVersions, id: \.version) { record in
-                Section("版本 \(record.version) · \(record.updatedAt)") {
-                    Text(record.payload["text"]?.string ?? "").textSelection(.enabled)
-                    Text((record.payload["kind"]?.string == "fact" ? "事实" : "推测") + " · " + (record.payload["status"]?.string == "confirmed" ? "已确认" : "待确认")) .font(.caption)
-                    if let reason = record.payload["change_reason"]?.string, !reason.isEmpty { Text("原因：" + reason).font(.caption) }
-                    Button("恢复此版本为新的待确认修订") { restoring = record }
-                }
+                CloudMemoryHistorySection(record: record) { restoring = record }
             }
             if model.cloudReviewBusy { ProgressView("读取历史…") }
             if model.cloudHistoryMore { Button("加载更早版本") { model.loadCloudHistory() }.disabled(model.cloudReviewBusy) }
@@ -176,13 +194,39 @@ struct CloudMemoryHistoryView: View {
         }
         .navigationTitle("记忆修改历史")
         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { model.closeCloudReview(); dismiss() } } }
-        .confirmationDialog("恢复为新的待确认修订？", isPresented: Binding(get: { restoring != nil }, set: { if !$0 { restoring = nil } }), titleVisibility: .visible) {
-            Button("恢复为待确认") {
-                do { if let version = restoring { try model.restoreCloudMemory(version, identity: identity) }; dismiss() }
-                catch { error = error.localizedDescription }; restoring = nil
-            }
+        .confirmationDialog("恢复为新的待确认修订？", isPresented: restorePresented, titleVisibility: .visible) {
+            Button("恢复为待确认", action: restore)
             Button("取消", role: .cancel) { restoring = nil }
         }
         .onChange(of: model.cloudReviewIdentity) { value in if value != identity { restoring = nil; dismiss() } }
+    }
+    private var restorePresented: Binding<Bool> {
+        Binding(get: { restoring != nil }, set: { if !$0 { restoring = nil } })
+    }
+    private func restore() {
+        do {
+            if let version = restoring { try model.restoreCloudMemory(version, identity: identity) }
+            dismiss()
+        } catch { error = error.localizedDescription }
+        restoring = nil
+    }
+}
+
+private struct CloudMemoryHistorySection: View {
+    let record: CloudRecord
+    let onRestore: () -> Void
+    private var state: String {
+        let kind = record.payload["kind"]?.string == "fact" ? "事实" : "推测"
+        let status = record.payload["status"]?.string == "confirmed" ? "已确认" : "待确认"
+        return "\(kind) · \(status)"
+    }
+    private var reason: String { record.payload["change_reason"]?.string ?? "" }
+    var body: some View {
+        Section("版本 \(record.version) · \(record.updatedAt)") {
+            Text(record.payload["text"]?.string ?? "").textSelection(.enabled)
+            Text(state).font(.caption)
+            if !reason.isEmpty { Text("原因：\(reason)").font(.caption) }
+            Button("恢复此版本为新的待确认修订", action: onRestore)
+        }
     }
 }

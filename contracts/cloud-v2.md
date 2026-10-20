@@ -48,6 +48,9 @@ Editing a referenced message automatically returns affected memories to pending 
 a history version explaining why. Deleting a source message removes derived memories and
 analyses/jobs containing that message, including old sync snapshots, to prevent recovery
 of deleted text through another view. No automatic merging of people or model auto-confirm.
+Changes to the effective confirmed memory set advance every live conversation context_revision
+for that profile, so existing client job caches cannot silently reuse analysis of old memory.
+Privacy deletion follows explanation/rewrite parent ancestry, including v1 parent snapshots.
 
 ## Memory history
 
