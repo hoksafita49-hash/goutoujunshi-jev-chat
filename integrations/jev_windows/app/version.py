@@ -1,3 +1,3 @@
 # -*- coding: utf-8 -*-
 """Preview version shown in the Windows overlay and used by the update check."""
-VERSION = "0.2.0-preview"
+VERSION = "0.2.1-preview"

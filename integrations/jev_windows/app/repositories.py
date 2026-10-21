@@ -5,6 +5,19 @@ import uuid
 import urllib.parse
 from .gateway import CloudError, evidence_for_ui, result_for_ui
 from .sync_worker import SyncCoordinator
+from .local_db import normalize_current_intent
+
+
+def reliable_chat_title(title):
+    if not isinstance(title, str):
+        return False
+    text = title.strip().casefold()
+    return bool(text) and text not in {
+        "已确认对话", "未识别会话", "未识别到会话", "尚未识别到会话", "当前会话", "未知会话",
+        "未命名会话", "未命名对话", "当前对话", "未命名", "未知", "未识别", "聊天记录", "本轮对话",
+        "微信", "wechat", "qq", "抖音", "douyin", "unknown", "untitled",
+    } and not any(part in text for part in (
+        "连接中", "正在连接", "未连接", "加载中", "同步中", "connecting", "loading", "syncing"))
 
 
 class CloudRepository:
@@ -114,8 +127,11 @@ class CloudRepository:
         return {**view, "evidence": evidence_for_ui(view)}
 
     def bind_chat(self, app, title, profile_uid, source_device):
-        if not title or not self.db.visible("profiles", profile_uid):
+        if not reliable_chat_title(title):
+            raise ValueError("当前标题无法确认身份，请在本轮核对页明确选择人物")
+        if not self.db.visible("profiles", profile_uid):
             raise ValueError("请先选择人物和当前会话")
+        self._live("profiles", profile_uid)
         identity = self.db.stable_uid(f"binding:{source_device}:{app}:{title}")
         self.db.save("identity_links", identity, dict(profile_uid=profile_uid, platform=app,
                                                       legacy_id=title, source_device=source_device))
@@ -124,8 +140,10 @@ class CloudRepository:
             self.db.save("conversations", conv, dict(profile_uid=profile_uid, title=title, platform=app, context_revision=0))
         return conv
 
-    def conversation_for(self, app, title, source_device):
-        binding = self.db.visible("identity_links", self.db.stable_uid(f"binding:{source_device}:{app}:{title}"))
+    def conversation_for(self, app, title, source_device, *, create=True):
+        if not reliable_chat_title(title):
+            raise ValueError("当前标题无法确认身份，请在本轮核对页明确选择人物")
+        binding = self.db.visible("identity_links", self.db.stable_uid(f"binding:{source_device}:{app}:{title}", create=create))
         links = [binding] if binding and not binding.get("deleted_at") else [r for r in self.db.list_records("identity_links") if
                  r["payload"].get("platform") == app and r["payload"].get("legacy_id") == title and
                  r["payload"].get("source_device") == source_device]
@@ -137,13 +155,41 @@ class CloudRepository:
         live = self.db.visible("profiles", profile)
         if not live or live.get("deleted_at"):
             raise ValueError("关联人物已删除，请重新确认人物")
-        conv = self.db.stable_uid(f"conversation:{source_device}:{app}:{title}:{profile}")
-        if not self.db.visible("conversations", conv):
+        conv = self.db.stable_uid(f"conversation:{source_device}:{app}:{title}:{profile}", create=create)
+        if create and not self.db.visible("conversations", conv):
             self.db.save("conversations", conv, dict(profile_uid=profile, title=title, platform=app, context_revision=0))
         return profile, conv
 
-    def analyze_confirmed(self, app, title, messages, source_device, preferences=None, source_messages=None):
-        profile, conv = self.conversation_for(app, title, source_device)
+    def review_context(self, app, title, source_device):
+        """An absent/unreliable binding never prevents reviewing a new capture."""
+        try:
+            return self.conversation_for(app, title, source_device, create=False)
+        except ValueError:
+            return None, None
+
+    def confirm_person(self, app, title, profile_uid, source_device, *, new_profile=None):
+        if new_profile is not None:
+            name = new_profile.get("name", "").strip()
+            if not name or len(name) > 200 or self.db.visible("profiles", profile_uid):
+                raise ValueError("新人物名称需要 1 至 200 字，且不能覆盖已有人物")
+            self.db.save("profiles", profile_uid, dict(name=name, stage="未填写", goal="自然接话", background="", notes=""))
+        self._live("profiles", profile_uid)
+        if reliable_chat_title(title):
+            return profile_uid, self.bind_chat(app, title, profile_uid, source_device)
+        # No automatic identity may survive an unnamed capture. Each confirmed
+        # review has a new conversation, even when explicitly choosing one person.
+        conversation = str(uuid.uuid4())
+        self.db.save("conversations", conversation, dict(profile_uid=profile_uid, title=title or "本轮对话",
+                                                        platform=app, context_revision=0))
+        return profile_uid, conversation
+
+    def analyze_confirmed(self, app, title, messages, source_device, preferences=None, source_messages=None, *,
+                          selected_profile_uid=None, new_profile=None, current_intent=None):
+        intent = normalize_current_intent(current_intent)
+        if selected_profile_uid is None:
+            profile, conv = self.conversation_for(app, title, source_device)
+        else:
+            profile, conv = self.confirm_person(app, title, selected_profile_uid, source_device, new_profile=new_profile)
         self.db.confirm_messages(conv, profile, messages, source_messages=source_messages)
         self.syncer.sync()
         if self.db.has_pending_context(profile, conv):
@@ -152,17 +198,20 @@ class CloudRepository:
         if not record or record.get("deleted_at"):
             raise RuntimeError("conversation_deleted")
         revision = record["payload"]["context_revision"]
-        result = self.run_job(conv, revision, preferences=preferences)
+        result = self.run_job(conv, revision, preferences=preferences, current_intent=intent)
         mapped = result_for_ui(result)
         mapped.update(profile_uid=profile, reviewed_messages=messages)
         return mapped
 
-    def run_job(self, conversation_uid, revision, kind="analysis", parent=None, selected_text=None, preferences=None, *, new_request=False):
+    def run_job(self, conversation_uid, revision, kind="analysis", parent=None, selected_text=None, preferences=None, *,
+                new_request=False, current_intent=None, resume_latest=False):
+        intent = normalize_current_intent(current_intent)
         pending = None
         if not new_request and preferences is None and parent is None and selected_text is None:
-            pending = self.db.latest_job(conversation_uid, revision, kind)
+            pending = self.db.latest_job(conversation_uid, revision, kind, current_intent=None if resume_latest else intent)
         pending = pending or self.db.prepare_job(conversation_uid, revision, kind, parent, selected_text,
-                                                 {**self.preferences(), **(preferences or {})}, new_request=new_request)
+                                                 {**self.preferences(), **(preferences or {})}, new_request=new_request,
+                                                 current_intent=intent)
         job = pending["job"]
         if (job.get("error") or {}).get("code") == "analysis_deleted":
             raise CloudError("analysis_deleted")

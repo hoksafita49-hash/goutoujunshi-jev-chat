@@ -9,7 +9,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator, model_validator
 
 from .pb_client import PBClient, PBError
 from .pipeline import PipelineError, object_from_text, run_pipeline
@@ -50,6 +50,21 @@ class Analysis(BaseModel):
     parent_analysis_id: str | None = Field(default=None, pattern=UID_PATTERN)
     selected_text: str | None = Field(default=None, max_length=4096)
     preferences: dict | None = None
+    current_intent: StrictStr | None = Field(default=None, max_length=2000)
+
+    @field_validator("current_intent")
+    @classmethod
+    def normalize_current_intent(cls, value):
+        # Validate the raw type/length first; never silently truncate user input.
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def followup_uses_parent_intent(self):
+        if self.kind != "analysis" and self.current_intent is not None:
+            raise ValueError("Followups inherit the original analysis intent")
+        return self
 
 
 def permit(starts, maximum):

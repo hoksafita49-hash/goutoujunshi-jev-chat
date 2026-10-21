@@ -63,7 +63,9 @@ data class Analysis(
     val cloudProfileUid: String? = null,
     val cloudDeviceId: String? = null,
     val stopCondition: String = "",
-    val hypotheses: List<String> = emptyList()
+    val hypotheses: List<String> = emptyList(),
+    /** Local review identity for a title that cannot safely create a reusable chat binding. */
+    val cloudReviewUid: String? = null
 )
 
 data class Choice(val choice: String, val confidence: Double, val probabilities: Map<String, Double>)

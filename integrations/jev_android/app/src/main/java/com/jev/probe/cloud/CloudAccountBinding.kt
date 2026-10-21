@@ -2,6 +2,7 @@ package com.jev.probe.cloud
 
 import com.jev.probe.core.ChatSnapshot
 import java.util.concurrent.CancellationException
+import java.util.UUID
 
 /** Authentication changes and short local transactions share this boundary. Never hold it over HTTP. */
 object CloudAccountBoundary {
@@ -36,4 +37,5 @@ class CloudAccountBinding private constructor(val session: CloudSession, private
 }
 
 data class CloudReview(val binding: CloudAccountBinding, val source: ChatSnapshot, val app: String,
-    val profileUid: String? = null)
+    val profileUid: String? = null, val choice: CloudReviewChoice? = null,
+    val reviewUid: String = UUID.randomUUID().toString())

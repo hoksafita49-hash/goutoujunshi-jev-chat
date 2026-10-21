@@ -14,10 +14,13 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.jev.probe.core.Analysis
@@ -28,6 +31,11 @@ import com.jev.probe.core.Prefs
 import com.jev.probe.core.RankedReply
 import com.jev.probe.SettingsActivity
 import com.jev.probe.KlineActivity
+import com.jev.probe.cloud.CloudReviewChoice
+import com.jev.probe.cloud.CloudReviewOptions
+import com.jev.probe.cloud.CloudAnalysisRequest
+import com.jev.probe.cloud.ReviewPersonChoice
+import com.jev.probe.cloud.ReviewTitle
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -316,10 +324,43 @@ class OverlayController(private val ctx: Context) {
     }
 
     /** OCR text is editable because both wording and speaker attribution can be wrong. */
-    fun showReview(snapshot: ChatSnapshot, onConfirm: (ChatSnapshot) -> Unit,
-                   onCancel: () -> Unit) {
+    fun showReview(snapshot: ChatSnapshot, onConfirm: (ChatSnapshot, CloudReviewChoice?) -> Unit,
+                   onCancel: () -> Unit, cloudPeople: CloudReviewOptions? = null) {
         ensureRoot()
         reviewCancel = onCancel
+        val people = cloudPeople?.contacts.orEmpty()
+        val newName = if (cloudPeople != null) EditText(ctx).apply {
+            contentDescription = "新人物称呼"
+            hint = "新人物称呼（1 至 200 字）"
+            textSize = 14f
+            setTextColor(Color.parseColor("#24382d"))
+            visibility = View.GONE
+            isSingleLine = true
+        } else null
+        val chooser = if (cloudPeople != null) Spinner(ctx).apply {
+            contentDescription = "本次人物"
+            adapter = ArrayAdapter(ctx, android.R.layout.simple_spinner_item,
+                listOf("请选择人物") + people.map { "${it.name} · ${it.id.takeLast(6)}" } + "＋ 明确新建人物").apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            val preselected = if (ReviewTitle.reliable(snapshot.title)) people.indexOfFirst { it.id == cloudPeople.preselectedProfileUid } else -1
+            setSelection(preselected + 1)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    newName?.visibility = if (position == people.size + 1) View.VISIBLE else View.GONE
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+        } else null
+        val supplement = if (cloudPeople != null) EditText(ctx).apply {
+            contentDescription = "本次补充"
+            hint = "例如：我现在不困，还想聊"
+            textSize = 14f
+            minLines = 2; maxLines = 4; gravity = Gravity.TOP
+            setTextColor(Color.parseColor("#24382d"))
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = card(10, Color.WHITE, stroke = true)
+        } else null
         val editor = EditText(ctx).apply {
             setText(snapshot.messages.joinToString("\n") {
                 (if (it.side == "me") "我：" else "对方：") + it.text
@@ -333,6 +374,22 @@ class OverlayController(private val ctx: Context) {
             background = card(10, Color.WHITE, stroke = true)
         }
         val confirm = bigButton("确认原文并分析") {
+            val choice = if (chooser != null) {
+                val person = when (val position = chooser.selectedItemPosition) {
+                    in 1..people.size -> ReviewPersonChoice(profileUid = people[position - 1].id)
+                    people.size + 1 -> {
+                        val name = newName?.text?.toString().orEmpty().trim()
+                        if (name.isEmpty() || name.codePointCount(0, name.length) > 200) {
+                            newName?.error = "请填写 1 至 200 字的新人物称呼"; return@bigButton
+                        }
+                        ReviewPersonChoice(newName = name)
+                    }
+                    else -> { toast("请先选择已有联系人或明确新建人物"); return@bigButton }
+                }
+                val text = try { CloudAnalysisRequest.intent(supplement?.text?.toString().orEmpty()) }
+                    catch (e: IllegalArgumentException) { supplement?.error = e.message; return@bigButton }
+                CloudReviewChoice(person, text)
+            } else null
             val lines = editor.text.toString().lines().map { it.trim() }.filter { it.isNotEmpty() }
             val messages = lines.mapNotNull { line ->
                 when {
@@ -350,12 +407,23 @@ class OverlayController(private val ctx: Context) {
                     root?.let { runCatching { wm.updateViewLayout(it, params) } }
                 }
                 onConfirm(snapshot.copy(messages = messages,
-                    note = (snapshot.note ?: "") + " · 原文与说话人已人工核对"))
+                    note = (snapshot.note ?: "") + " · 原文与说话人已人工核对"), choice)
             }
         }
-        setContent(listOf(line("核对本轮对话", "#24382d", 16f, true),
-            hint("识别结果可能有错。修改每行的“我／对方”和正文，确认后才调用分析模型。"),
-            editor, confirm))
+        val views = mutableListOf<View>(line("核对本轮对话", "#24382d", 16f, true))
+        if (chooser != null) {
+            views.add(line("本次人物", "#24382d", 14f, true)); views.add(chooser); views.add(checkNotNull(newName))
+            views.add(hint(if (ReviewTitle.reliable(snapshot.title)) "确认人物；选择同一人物可跨应用沿用已确认记忆。"
+                else "当前标题无法可靠确认人物，请本轮主动选择；下次仍需重新选择。"))
+        }
+        views.add(hint("识别结果可能有错。修改每行的“我／对方”和正文，确认后才调用分析模型。"))
+        views.add(editor)
+        if (supplement != null) {
+            views.add(line("本次补充（可选，最多 2000 字）", "#24382d", 14f, true)); views.add(supplement)
+            views.add(hint("仅用于本次分析及后续改写，不自动记入人物档案。新一轮默认留空。"))
+        }
+        views.add(confirm)
+        setContent(views)
         if (!expanded) toggle()
         lp?.let { params ->
             params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()

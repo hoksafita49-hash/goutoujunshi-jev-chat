@@ -507,10 +507,22 @@ function createJob(app, session, data) {
           "parent_analysis_id",
           "selected_text",
           "preferences",
+          "current_intent",
         ].indexOf(k) < 0,
     )
   )
     fail("invalid_analysis");
+  // Normalize before hashing so blank input replays an older omitted-field job.
+  // Unicode code points match the public API and Windows/Android field limits.
+  data = Object.assign({}, data);
+  if (data.current_intent !== undefined) {
+    if (typeof data.current_intent !== "string" || Array.from(data.current_intent).length > 2000)
+      fail("invalid_current_intent");
+    data.current_intent = data.current_intent.trim();
+    if (!data.current_intent) delete data.current_intent;
+  }
+  if (data.kind !== "analysis" && data.current_intent !== undefined)
+    fail("invalid_current_intent");
   const digest = $security.sha256(canonical(data));
   const prior = first(app, "cloud_jobs", "owner={:o} && request_id={:r}", {
     o: session.owner,
@@ -593,6 +605,7 @@ function createJob(app, session, data) {
     preferences: Object.assign({}, prefs && !prefs.getString("deleted_at") ? parsed(prefs, "payload") : {},
       data.preferences === undefined ? {} : evidenceMemory.preferences(data.preferences, domainHelpers())),
     selected_text: data.selected_text || "",
+    current_intent: data.current_intent || "",
   };
   if (
     String(input.selected_text).length > 4096 ||
@@ -612,6 +625,11 @@ function createJob(app, session, data) {
       fail("parent_analysis_unavailable");
     input.parent_result = parsed(parent, "result");
     input.parent_analysis_id = parent.getString("uid");
+    // Only the owner's original request is authoritative, never model output
+    // or a more recent analysis of the same conversation.
+    const parentInput = parsed(parent, "input") || {};
+    input.current_intent = typeof parentInput.current_intent === "string"
+      ? parentInput.current_intent : "";
   }
   const job = new Record(app.findCollectionByNameOrId("cloud_jobs"));
   job.set("owner", session.owner);

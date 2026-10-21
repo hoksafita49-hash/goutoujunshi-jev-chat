@@ -33,6 +33,8 @@ import com.jev.probe.cloud.CloudRuntime
 import com.jev.probe.cloud.CloudAccountBinding
 import com.jev.probe.cloud.CloudAccountBoundary
 import com.jev.probe.cloud.CloudReview
+import com.jev.probe.cloud.CloudReviewOptions
+import com.jev.probe.cloud.ReviewTitle
 import com.jev.probe.cloud.AndroidCloudSessionAccess
 import com.jev.probe.cloud.CloudRewrite
 import com.jev.probe.jev.ExplanationFormat
@@ -44,6 +46,17 @@ import java.util.concurrent.CancellationException
 import java.util.concurrent.FutureTask
 
 internal fun shouldIgnoreAccessibilityEvents(reviewPending: Boolean): Boolean = reviewPending
+
+/** A missing title cannot identify a chat: require its original visible text after overlay focus returns. */
+internal fun unreliableReviewMatchesLive(live: ChatSnapshot, source: ChatSnapshot): Boolean =
+    !ReviewTitle.reliable(source.title) && live.title == source.title && live.messages == source.messages
+
+internal fun captureReviewSignature(snapshot: ChatSnapshot, cloudMode: Boolean): String {
+    if (!cloudMode || ReviewTitle.reliable(snapshot.title)) return snapshot.signature()
+    return "${snapshot.title?.length ?: -1}:${snapshot.title.orEmpty()}|" + snapshot.messages.joinToString("|") {
+        "${it.side.length}:${it.side}:${it.text.length}:${it.text}"
+    }
+}
 
 internal fun shouldReviewOcr(manual: Boolean, autoAnalyze: Boolean, latestFrom: String?): Boolean =
     manual || (autoAnalyze && latestFrom == "other")
@@ -135,6 +148,7 @@ open class ChatCaptureService : AccessibilityService() {
     private var lastAnalysis: com.jev.probe.core.Analysis? = null
     private var lastAnalyzedSnapshot: ChatSnapshot? = null
     private var lastContext: ChatContext? = null
+    private var reviewedSource: ChatSnapshot? = null
     private var explanationGeneration = 0
 
     /** What the screen looked like the last time we fired an automatic shot.
@@ -373,7 +387,7 @@ open class ChatCaptureService : AccessibilityService() {
         // whose last few messages happen to match cannot swallow each other.
         if (pkg != activePkg) { activePkg = pkg; lastSignature = "" }
 
-        val sig = snapshot.signature()
+        val sig = captureReviewSignature(snapshot, prefs.cloudEnabled)
         val showing = overlay?.isShowing() == true
         // Same content and the bubble is already up → nothing to do.
         if (sig == lastSignature && showing) return
@@ -416,6 +430,8 @@ open class ChatCaptureService : AccessibilityService() {
      *  (if any), and otherwise remember the current title as the new good one. */
     private fun stabilizeTitle(pkg: String, snapshot: ChatSnapshot): ChatSnapshot {
         if (isTransientTitle(snapshot.title)) {
+            // A cloud review must actively choose a person for an unreliable title.
+            if (prefs.cloudEnabled) return snapshot
             val good = lastGoodTitle[pkg] ?: return snapshot
             return snapshot.copy(title = good)
         }
@@ -438,6 +454,7 @@ open class ChatCaptureService : AccessibilityService() {
         lastAnalysis = null
         lastAnalyzedSnapshot = null
         lastContext = null
+        reviewedSource = null
         overlay?.resetForNewConversation()
     }
 
@@ -521,7 +538,8 @@ open class ChatCaptureService : AccessibilityService() {
                 try {
                     val boundReview = checkNotNull(review)
                     boundReview.binding.assertCurrent()
-                    val analysis = CloudAnalysis(this, binding = boundReview.binding).analyze(snapshot, pkg, boundReview.source, boundReview.profileUid)
+                    val analysis = CloudAnalysis(this, binding = boundReview.binding).analyze(snapshot, pkg, boundReview.source,
+                        boundReview.profileUid, boundReview.choice, boundReview.reviewUid)
                     finishAnalysis(token, snapshot, pkg) {
                         if (CloudRuntime.current(this, cloudSession) && CloudRuntime.analysisCurrent(this, analysis, snapshot.title, pkg)) {
                             lastAnalysis = analysis; lastAnalyzedSnapshot = snapshot; lastContext = null
@@ -582,7 +600,10 @@ open class ChatCaptureService : AccessibilityService() {
         // A new chat can be visible before OCR finishes and updates currentSnapshot.
         // Check the live title too, so the previous chat's result cannot flash over it.
         val adapter = adapters[pkg] ?: return true // manual OCR in an unadapted app
-        val liveTitle = adapter.extract(root, resources)?.title ?: return false
+        val live = adapter.extract(root, resources) ?: return false
+        if (prefs.cloudEnabled && !ReviewTitle.reliable(snapshot.title))
+            return unreliableReviewMatchesLive(live, reviewedSource ?: snapshot)
+        val liveTitle = live.title ?: return false
         return isTransientTitle(liveTitle) || liveTitle == snapshot.title
     }
 
@@ -925,16 +946,19 @@ open class ChatCaptureService : AccessibilityService() {
         val cloudReview = if (prefs.cloudEnabled) try {
             val binding = CloudAccountBinding.capture(AndroidCloudSessionAccess(this))
             val person = binding.withCurrent { com.jev.probe.data.ContactRepository(this, it).findContact(snapshot.title ?: "已确认对话", pkg)?.id }
-            CloudReview(binding, snapshot, pkg, person)
+            CloudReview(binding, if (!ReviewTitle.reliable(snapshot.title)) reviewedSource ?: snapshot else snapshot, pkg, person)
         } catch (e: Exception) { overlay?.showError(e.message ?: "请先登录云账号"); return } else null
         val token = session.beginReview() ?: return
-        overlay?.showReview(snapshot, onConfirm = { confirmed ->
+        val people = try { cloudReview?.let { review -> review.binding.withCurrent { captured ->
+            CloudReviewOptions(com.jev.probe.data.ContactRepository(this, captured).contacts(), review.profileUid)
+        } } } catch (e: Exception) { cancelWork(); overlay?.showError(e.message ?: "请重新登录后核对"); return }
+        overlay?.showReview(snapshot, onConfirm = { confirmed, choice ->
             if (!session.isCurrent(token) || !session.reviewPending) return@showReview
             try { cloudReview?.binding?.assertCurrent() } catch (_: CancellationException) {
                 cancelWork(); overlay?.showError("云账号已切换，请重新核对"); return@showReview
             }
             overlay?.showLoading()
-            completeReviewConfirmation(confirmed, pkg, token, cloudReview)
+            completeReviewConfirmation(confirmed, pkg, token, cloudReview?.copy(choice = checkNotNull(choice)))
         }, onCancel = {
             if (session.isCurrent(token)) {
                 cancelWork()
@@ -942,7 +966,7 @@ open class ChatCaptureService : AccessibilityService() {
                 activePkg = pkg
                 overlay?.showIdle(snapshot.title)
             }
-        })
+        }, cloudPeople = people)
         if (overlay?.isShowing() != true) cancelWork()
     }
 
@@ -978,8 +1002,15 @@ open class ChatCaptureService : AccessibilityService() {
                 overlay?.showError("聊天应用已切换，请重新识别后再分析")
             }
             ReviewConfirmationState.CHAT_CURRENT -> {
+                if (cloudReview != null && !ReviewTitle.reliable(confirmed.title) && adapters[pkg] != null) {
+                    val live = rootInActiveWindow?.let { adapters[pkg]?.extract(it, resources) }
+                    if (live == null || !unreliableReviewMatchesLive(live, cloudReview.source)) {
+                        cancelWork(); overlay?.showError("当前聊天原文已改变，请重新核对人物与原文"); return
+                    }
+                }
                 if (!session.confirmReview(token)) return
                 overlay?.finishReview()
+                reviewedSource = cloudReview?.source
                 currentSnapshot = confirmed
                 pendingSnapshot = confirmed
                 main.removeCallbacks(debounce)

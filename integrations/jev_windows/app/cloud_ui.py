@@ -503,7 +503,8 @@ class CloudPanel(QWidget):
                         conv = repo.db.visible("conversations", conv_uid)
                         if not conv or conv.get("deleted_at") or repo.db.has_pending_context(profile["uid"], conv_uid):
                             raise RuntimeError("当前会话已删除或仍有未同步内容")
-                        result = repo.run_job(conv_uid, conv["payload"]["context_revision"], new_request=new_request)
+                        result = repo.run_job(conv_uid, conv["payload"]["context_revision"], new_request=new_request,
+                                              resume_latest=not new_request)
                         service.sync()
                         return result
                     return service._guard(guarded)

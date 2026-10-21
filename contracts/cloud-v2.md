@@ -12,6 +12,39 @@ Explicit empty style clears it. Clients preserve unknown preference fields on sa
 iOS exposes style in its settings and reads/saves it. Draft prompt requests the chosen
 count and style; server bounds returned candidates to count without inventing text.
 
+## Per-analysis person and current intent (Windows/Android, 2026-10-21)
+
+The review page explicitly selects a live profile or stages a new profile until
+confirmation. Platform conversation bindings remain device-specific; the same
+profile can own conversations from several platforms. Confirmed memories are
+selected by profile, while raw messages remain scoped to the selected conversation.
+Changing a binding affects future input and never reparents historical messages.
+Blank, placeholder or transient titles must not recover/create persistent person
+bindings. Explicitly selected unnamed reviews use an isolated conversation identity.
+
+`POST /v1/analyses` accepts optional `current_intent` for `kind: "analysis"`:
+a strict string, at most 2000 Unicode code points before trimming. Blank input is
+omitted and keeps the legacy idempotency digest and persisted client request body.
+Nonempty intent participates in the durable request fingerprint; editing it cannot
+reuse a job for another intent. A network-ambiguous retry retains the exact original
+body and request ID. Explicit task recovery resumes that original request.
+
+PocketBase stores normalized `job.input.current_intent` with the immutable analysis
+snapshot, not in profiles, notes, preferences or memories. Rewrite/explanation reads
+it from the selected successful parent's input; client nonempty overrides are
+rejected. Model result fields and newer analyses cannot replace the user's original
+input. Legacy parents without the field contribute an empty string.
+
+Evidence, drafting, ordering and followup prompts receive the same input. Stated
+current state/goals take priority over stale profile goals and model guesses;
+they are not chat messages or evidence of what the other person said. Existing
+quote validation still accepts only actual immutable message text. There is no
+additional model call or automatic long-term memory write. New review input starts
+blank; keeping it with a durable analysis does not mean it is never stored.
+
+This is additive and old clients may omit the field. iOS work and screenshot/OCR
+changes are deferred. Data association does not add capture support for a platform.
+
 ## Evidence
 
 Analysis results retain facts/hypotheses/unknowns string arrays for old clients and add
@@ -72,5 +105,6 @@ history pagination and optimistic conflicts, source edits/deletes and old receip
 Pipeline tests use fake models; no paid call. Three clients test preference preservation,
 evidence mapping and memory lifecycle/recovery. Existing v1 results remain readable.
 No schema migration required. Private server rollout must first take a consistent backup;
-domain/public HTTPS remains deferred. iOS remote simulator/unsigned build is validation,
-not Apple signing or actual-device acceptance.
+The personal deployment enabled trusted HTTPS on 2026-10-21; the older cutover
+stage is recorded separately. iOS work is deferred: its remote simulator/unsigned
+build is validation, not Apple signing or actual-device acceptance.

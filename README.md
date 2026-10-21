@@ -45,7 +45,12 @@ Android、iOS 主 App 和 Windows 新增“统一云服务”模式：使用同�
 
 服务端使用 PocketBase 0.40.5 的私有集合和事务扩展；客户端使用按账号隔离的 SQLite、持久待上传队列与冲突处理。姓名相同不会自动合并人物；旧资料须预览确认后导入。云模式仅使用本地 OCR，原文核对后才上传。
 
-当前为开发预览，尚未替换下方公开 Release 下载。服务端部署见 [部署说明](deploy/README.md)，协议见 [cloud-v1](contracts/cloud-v1.md)，平台配置见各端 README。域名审核期间仅用 SSH 隧道联调；iOS 已通过远程 Swift 检查和模拟器/未签名设备构建，仍需 Apple 签名和真机验收。
+当前为开发预览，尚未替换下方公开 Release 下载。服务端部署见 [部署说明](deploy/README.md)，协议见 [cloud-v1](contracts/cloud-v1.md)，平台配置见各端 README。早期域名审核期间曾用 SSH 隧道联调；iOS 已通过远程 Swift 检查和模拟器/未签名设备构建，仍需 Apple 签名和真机验收。
+
+2026-10-21 个人部署已启用可信 HTTPS；当前维护 Windows 和 Android，iOS 暂缓。
+双端云核对页可直接选择已有联系人或明确新建，并填写可选“本轮想法”。同一人物在不同
+平台的会话共享其已确认记忆；本轮补充只随分析保存，后续改写继续沿用，不自动变成长期
+记忆。具体操作和边界见[联系人选择与本次想法](docs/contact-intent.md)。
 
 ## 选择你的平台
 

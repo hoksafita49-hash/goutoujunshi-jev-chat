@@ -3,8 +3,6 @@ package com.jev.probe.cloud
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
-import java.net.ServerSocket
-import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -13,7 +11,7 @@ class GatewayClientTest {
     @Test fun gatewayPreserves202GetAndDeviceHeadersWithoutRetryingOrFollowingRedirects() {
         val count = AtomicInteger()
         val failure = AtomicReference<Throwable?>()
-        val server = ServerSocket(18000, 5, InetAddress.getByName("127.0.0.1"))
+        val server = LoopbackGatewayTestServer()
         val serving = thread(isDaemon = true) {
             try {
                 while (!server.isClosed) {

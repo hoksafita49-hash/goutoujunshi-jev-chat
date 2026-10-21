@@ -3,6 +3,8 @@ package com.jev.probe.cloud
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.jev.probe.data.LocalDatabase
+import com.jev.probe.data.ContactRepository
+import com.jev.probe.core.kb.Contact
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -13,8 +15,6 @@ import org.robolectric.annotation.Config
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicReference
-import java.net.ServerSocket
-import java.net.InetAddress
 import kotlin.concurrent.thread
 
 @RunWith(RobolectricTestRunner::class)
@@ -202,11 +202,12 @@ class EvidenceMemoryTest {
     @Test fun oldJobKeyStillReturnsSavedResultWithoutAnotherPost() {
         val session = account().copy(baseUrl = "http://127.0.0.1:18000")
         val db = LocalDatabase.get(context, session.accountKey)
-        mirror(db, record("conversations", "c", 1, JSONObject().put("profile_uid", "p").put("context_revision", 2)))
+        ContactRepository(context, session).saveContact(Contact("p", "人物", listOf("聊天"), listOf("chat")))
+        mirror(db, record("conversations", "c", 1, JSONObject().put("profile_uid", "p").put("title", "聊天").put("platform", "chat").put("context_revision", 2)))
         db.saveJob("c|2|explain|a||", JSONObject().put("request_id", "saved-id"), "existing", JSONObject().put("kept", true))
         val analysis = CloudProtocol.analysis(JSONObject("""{"schema_version":1,"analysis_id":"a","conversation_uid":"c","context_revision":2,"candidates":[],"ranking_status":"unavailable"}"""))
-            .copy(cloudAccount = session.accountKey, cloudDeviceId = session.deviceId)
-        val server = ServerSocket(18000, 5, InetAddress.getByName("127.0.0.1"))
+            .copy(cloudAccount = session.accountKey, cloudDeviceId = session.deviceId, cloudProfileUid = "p")
+        val server = LoopbackGatewayTestServer()
         val unexpected = AtomicReference<String?>()
         val serving = thread(isDaemon = true) { try {
             server.accept().use { socket ->

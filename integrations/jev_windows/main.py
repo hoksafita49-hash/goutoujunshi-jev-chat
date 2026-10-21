@@ -211,7 +211,7 @@ def on_settings_saved():
     ov.set_status("设置已保存；识图服务已重新载入", "success")
 
 
-def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=None, account_identity=None, captured_app=None, source_messages=None, expected_context=None):
+def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=None, account_identity=None, captured_app=None, source_messages=None, expected_context=None, *, selected_profile_uid=None, new_profile=None, current_intent=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
     try:
         if account_identity is not None and settings.cloud_mode() is not True:
@@ -223,7 +223,8 @@ def analyze_bg(msgs, title, revision, reply_to=None, epoch=None, relationship=No
             service = current()
             identity = account_identity or service.identity
             result = service.analyze(captured_app or state["app"], title, msgs, None,
-                                     expected_identity=identity, source_messages=source_messages, expected_context=expected_context)
+                                     expected_identity=identity, source_messages=source_messages, expected_context=expected_context,
+                                     selected_profile_uid=selected_profile_uid, new_profile=new_profile, current_intent=current_intent)
             result["cloud_identity"] = identity
             result["reviewed_messages"] = msgs
             results.put(("ok", result, title, revision, epoch))
@@ -263,17 +264,21 @@ def start_analyze(title, msgs):
         account_identity = current().identity
     revision_of = lambda: chat_of(title, app)["rev"]
     expected_context = None
+    review_options = {}
+    analysis_options = {}
     try:
         if settings.cloud_mode() is True:
             try:
                 service = current()
-                expected_context = service.require().conversation_for(app, title, service.source_device)
+                repo = service.require()
+                expected_context = repo.review_context(app, title, service.source_device)
+                review_options = dict(profiles=repo.db.list_records("profiles"), selected_profile_uid=expected_context[0])
             except (RuntimeError, ValueError) as exc:
                 ov.set_status(str(exc)[:220], "warning")
                 return
         dialog = ReviewDialog(title, msgs, ov.win,
                               history_of=lambda: list(chat_of(title, app)["history"]),
-                              revision_of=revision_of)
+                              revision_of=revision_of, **review_options)
         if not dialog.exec():
             ov.set_status("已取消本轮分析")
             return
@@ -284,6 +289,9 @@ def start_analyze(title, msgs):
         original_rows = getattr(dialog, "_source_rows", None)
         original_rows = list(original_rows) if isinstance(original_rows, (list, tuple)) else list(msgs)
         msgs = dialog.messages
+        if review_options:
+            analysis_options = dict(selected_profile_uid=dialog.selected_profile_uid, new_profile=dialog.new_profile,
+                                    current_intent=dialog.current_intent)
     finally:
         state["reviewing"] = False
     if settings.cloud_mode() is True:
@@ -302,6 +310,7 @@ def start_analyze(title, msgs):
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, revision_of(), reply_to,
                                              epoch, settings.profile_context(title), account_identity, app, original_rows, expected_context),
+                     kwargs=analysis_options,
                      daemon=True).start()
 
 

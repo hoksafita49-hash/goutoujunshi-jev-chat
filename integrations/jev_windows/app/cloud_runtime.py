@@ -102,14 +102,16 @@ class CloudSession:
             return repo.syncer.sync()
         return self._guard(action)
 
-    def analyze(self, app, title, messages, preferences, *, expected_identity=None, source_messages=None, expected_context=None):
+    def analyze(self, app, title, messages, preferences, *, expected_identity=None, source_messages=None, expected_context=None,
+                selected_profile_uid=None, new_profile=None, current_intent=None):
         def action():
             if expected_identity is not None and self.identity != expected_identity:
                 raise RuntimeError("account_changed：账号已变化，请重新核对原文")
             repo = self.require()
-            if expected_context is not None and repo.conversation_for(app, title, self.source_device) != tuple(expected_context):
+            if expected_context is not None and repo.review_context(app, title, self.source_device) != tuple(expected_context):
                 raise RuntimeError("context_changed：人物关联已变化，请重新核对原文")
-            return repo.analyze_confirmed(app, title, messages, self.source_device, preferences, source_messages=source_messages)
+            return repo.analyze_confirmed(app, title, messages, self.source_device, preferences, source_messages=source_messages,
+                                          selected_profile_uid=selected_profile_uid, new_profile=new_profile, current_intent=current_intent)
         return self._guard(action)
 
     def extra(self, result, kind, index=None):

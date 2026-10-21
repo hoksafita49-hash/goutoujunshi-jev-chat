@@ -15,6 +15,14 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def normalize_current_intent(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) > 2000:
+        raise ValueError("本轮想法最多 2000 字")
+    return value.strip()
+
+
 class LocalDatabase:
     def __init__(self, root, server, account):
         self.path = Path(root) / (hashlib.sha256((server + "\n" + account).encode()).hexdigest() + ".sqlite3")
@@ -241,13 +249,14 @@ class LocalDatabase:
             elif edit:
                 self._queue(row["kind"], row["uid"], json.loads(edit["payload"]), edit["action"])
 
-    def stable_uid(self, source):
+    def stable_uid(self, source, *, create=True):
         with self.lock, self.conn:
             row = self.conn.execute("SELECT uid FROM legacy WHERE key=?", (source,)).fetchone()
             if row:
                 return row[0]
             value = str(uuid.uuid5(uuid.NAMESPACE_URL, self.path.stem + ":" + source))
-            self.conn.execute("INSERT INTO legacy VALUES (?,?)", (source, value))
+            if create:
+                self.conn.execute("INSERT INTO legacy VALUES (?,?)", (source, value))
             return value
 
     def confirm_messages(self, conversation_uid, profile_uid, messages, source_messages=None):
@@ -317,8 +326,13 @@ class LocalDatabase:
             with self.conn:
                 self._set_meta("confirmed:" + conversation_uid, encode(snapshot))
 
-    def prepare_job(self, conversation_uid, revision, kind, parent=None, selected_text=None, preferences=None, *, new_request=False):
+    def prepare_job(self, conversation_uid, revision, kind, parent=None, selected_text=None, preferences=None, *, new_request=False, current_intent=None):
         body = dict(conversation_uid=conversation_uid, context_revision=revision, kind=kind)
+        intent = normalize_current_intent(current_intent)
+        if intent:
+            if kind != "analysis" or parent:
+                raise ValueError("后续任务从原分析继承本轮想法")
+            body["current_intent"] = intent
         if parent:
             body["parent_analysis_id"] = parent
         if selected_text:
@@ -364,13 +378,18 @@ class LocalDatabase:
                     conversation_uid=body["conversation_uid"], context_revision=body["context_revision"],
                     error=dict(code="analysis_deleted"))
 
-    def latest_job(self, conversation_uid, revision, kind):
+    def latest_job(self, conversation_uid, revision, kind, *, current_intent=None):
         with self.lock:
             for row in self.conn.execute("SELECT * FROM jobs ORDER BY rowid DESC"):
                 body = json.loads(row["body"])
+                job = json.loads(row["job"])
+                deleted = (job.get("error") or {}).get("code") == "analysis_deleted"
                 if (body.get("conversation_uid") == conversation_uid and body.get("context_revision") == revision
-                        and body.get("kind") == kind):
-                    return dict(request_id=row["request_id"], body=body, job=json.loads(row["job"]))
+                        and body.get("kind") == kind and (deleted or current_intent is None or
+                        body.get("current_intent", "") == current_intent)):
+                    # Tombstones deliberately scrub private intent. They still
+                    # block an implicit paid replacement for this same context.
+                    return dict(request_id=row["request_id"], body=body, job=job)
         return None
 
     def has_pending_context(self, profile, conversation):

@@ -11,7 +11,6 @@ import com.jev.probe.core.WorkScope
 import com.jev.probe.data.ContactRepository
 import com.jev.probe.sync.SyncCoordinator
 import org.json.JSONObject
-import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.CancellationException
@@ -44,8 +43,7 @@ object CloudRuntime {
         val session = SessionStore(context).load() ?: return false
         if (!Prefs(context).cloudEnabled || analysis.cloudAccount != session.accountKey || analysis.cloudDeviceId != session.deviceId) return false
         val repository = ContactRepository(context, session)
-        return repository.findContact(title ?: "已确认对话", app)?.id == analysis.cloudProfileUid &&
-            repository.db.record("conversations", analysis.conversationUid ?: "")?.optJSONObject("payload")?.optInt("context_revision") == analysis.contextRevision
+        return repository.analysisCurrent(analysis, title, app)
     }
     fun schedule(context: Context) {
         val app = context.applicationContext
@@ -71,19 +69,24 @@ class AndroidCloudSessionAccess(private val context: Context) : CloudSessionAcce
 class CloudAnalysis(private val context: Context,
     private val accounts: CloudSessionAccess = AndroidCloudSessionAccess(context),
     private val binding: CloudAccountBinding = CloudAccountBinding.capture(accounts)) {
-    fun analyze(snapshot: ChatSnapshot, app: String, source: ChatSnapshot = snapshot, expectedProfileUid: String? = null): Analysis {
+    fun analyze(snapshot: ChatSnapshot, app: String, source: ChatSnapshot = snapshot, expectedProfileUid: String? = null,
+        choice: CloudReviewChoice? = null, reviewUid: String? = null): Analysis {
         binding.assertCurrent()
+        val currentIntent = CloudAnalysisRequest.intent(choice?.currentIntent.orEmpty())
         val session = binding.session
         val repo = ContactRepository(context, session)
-        val (profile, conversation) = binding.withCurrent { repo.confirm(snapshot, app, source, binding, expectedProfileUid) }
+        val (profile, conversation) = binding.withCurrent {
+            repo.confirm(snapshot, app, source, binding, expectedProfileUid, choice?.person, reviewUid)
+        }
         binding.assertCurrent()
         SyncCoordinator(context, session).sync()
         check(repo.db.pendingCount() == 0) { "资料存在待上传或冲突，请到云账号页处理后再分析" }
         val revision = repo.db.record("conversations", conversation)?.getJSONObject("payload")?.getInt("context_revision")
             ?: error("对话尚未同步")
         check(CloudRuntime.current(context, session)) { "账号已变化" }
-        val result = execute(binding.withCurrent { it }, conversation, revision, "analysis")
-        val analysis = CloudProtocol.analysis(result).copy(cloudAccount = session.accountKey, cloudProfileUid = profile, cloudDeviceId = session.deviceId)
+        val result = execute(binding.withCurrent { it }, conversation, revision, "analysis", currentIntent = currentIntent)
+        val analysis = CloudProtocol.analysis(result).copy(cloudAccount = session.accountKey, cloudProfileUid = profile,
+            cloudDeviceId = session.deviceId, cloudReviewUid = reviewUid?.takeIf { !ReviewTitle.reliable(snapshot.title) })
         check(CloudRuntime.analysisCurrent(context, analysis, snapshot.title, app)) { "人物或上下文已更新，请重新核对分析；原任务已保留" }
         return analysis
     }
@@ -91,29 +94,26 @@ class CloudAnalysis(private val context: Context,
         val session = binding.withCurrent { it }
         check(analysis.cloudAccount == session.accountKey && analysis.cloudDeviceId == session.deviceId) { "账号或设备已切换，请重新分析" }
         val repo = ContactRepository(context, session)
-        check(repo.db.record("conversations", checkNotNull(analysis.conversationUid))?.getJSONObject("payload")?.getInt("context_revision") == analysis.contextRevision) {
-            "上下文版本已更新，请重新分析"
+        val conversation = repo.db.record("conversations", checkNotNull(analysis.conversationUid))?.optJSONObject("payload")
+        check(conversation != null && repo.analysisCurrent(analysis, conversation.optString("title"), conversation.optString("platform"))) {
+            "人物或上下文版本已更新，请重新分析"
         }
         return execute(session, checkNotNull(analysis.conversationUid), checkNotNull(analysis.contextRevision), kind,
             checkNotNull(analysis.analysisId), selected)
     }
     private fun execute(session: CloudSession, conversation: String, revision: Int, kind: String,
-        parent: String? = null, selected: String? = null): JSONObject {
+        parent: String? = null, selected: String? = null, currentIntent: String = ""): JSONObject {
         val db = ContactRepository(context, session).db
         val client = GatewayClient(session.baseUrl, session)
         val storedPreferences = db.record("preferences", CloudProtocol.PREFERENCES_UID)?.optJSONObject("payload")
         // Keep the v1 lookup key so an upgrade never replaces a persisted request ID/body.
-        val key = "$conversation|$revision|$kind|${parent.orEmpty()}|${selected.orEmpty()}|${storedPreferences?.toString().orEmpty()}"
+        val key = CloudAnalysisRequest.key(conversation, revision, kind, parent, selected, storedPreferences, currentIntent)
         val preferences = EvidenceMemoryPreferences.request(storedPreferences ?: JSONObject())
         binding.assertCurrent()
         val existing = db.job(key)
         check(existing?.optBoolean("local_cancelled") != true) { "原分析或来源已删除，此任务已取消；请核对新的对话上下文" }
         existing?.optJSONObject("result")?.let { return it }
-        val body = existing?.getJSONObject("body") ?: JSONObject().put("request_id", UUID.randomUUID().toString())
-            .put("conversation_uid", conversation).put("context_revision", revision).put("kind", kind).apply {
-                parent?.let { put("parent_analysis_id", it) }; selected?.let { put("selected_text", it) }
-                put("preferences", preferences)
-            }
+        val body = existing?.getJSONObject("body") ?: CloudAnalysisRequest.body(conversation, revision, kind, parent, selected, preferences, currentIntent)
         // Persist before the POST. A later explicit user retry reuses these exact bytes and request_id.
         var id = existing?.optString("analysis_id")?.takeIf { it.isNotBlank() && it != "null" }
         if (id == null) {

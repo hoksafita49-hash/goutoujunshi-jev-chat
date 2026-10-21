@@ -13,8 +13,6 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.UUID
-import java.net.ServerSocket
-import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -195,14 +193,16 @@ class LocalDatabaseTest {
     @Test fun cancelledJobCannotReturnTextOrCreateAnotherPaidRequest() {
         val session = CloudSession("http://127.0.0.1:18000", "t", UUID.randomUUID().toString(), "e", "d", "s", "epoch")
         val db = LocalDatabase.get(context, session.accountKey)
-        db.applyPage(page(record(uid = "c").put("entity_type", "conversations").put("payload", JSONObject().put("context_revision", 2))))
+        com.jev.probe.data.ContactRepository(context, session).saveContact(com.jev.probe.core.kb.Contact("p", "人物", listOf("聊天"), listOf("chat")))
+        db.applyPage(page(record(uid = "c").put("entity_type", "conversations").put("payload", JSONObject()
+            .put("profile_uid", "p").put("title", "聊天").put("platform", "chat").put("context_revision", 2))))
         val key = "c|2|explain|parent||"
         val body = JSONObject().put("request_id", "cancelled-request").put("conversation_uid", "c").put("context_revision", 2).put("kind", "explain").put("parent_analysis_id", "parent")
         db.saveJob(key, body, "a", JSONObject().put("text", "已删除任务结果"))
         db.applyPage(page(record(uid = "a", version = 2, deleted = true).put("entity_type", "analyses").put("payload", JSONObject())))
         val analysis = CloudProtocol.analysis(JSONObject("""{"schema_version":1,"analysis_id":"parent","conversation_uid":"c","context_revision":2,"candidates":[],"ranking_status":"unavailable"}"""))
-            .copy(cloudAccount = session.accountKey, cloudDeviceId = session.deviceId)
-        val server = ServerSocket(18000, 5, InetAddress.getByName("127.0.0.1")); val unexpected = AtomicReference<String?>()
+            .copy(cloudAccount = session.accountKey, cloudDeviceId = session.deviceId, cloudProfileUid = "p")
+        val server = LoopbackGatewayTestServer(); val unexpected = AtomicReference<String?>()
         val serving = thread(isDaemon = true) { try { server.accept().use { socket ->
             unexpected.set(socket.getInputStream().bufferedReader().readLine())
             val response = "{\"error\":{\"code\":\"unexpected_request\"}}"

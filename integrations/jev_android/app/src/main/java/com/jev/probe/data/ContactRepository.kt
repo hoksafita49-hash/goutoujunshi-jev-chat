@@ -4,8 +4,12 @@ import android.content.Context
 import com.jev.probe.cloud.CloudProtocol
 import com.jev.probe.cloud.CloudSession
 import com.jev.probe.cloud.CloudAccountBinding
+import com.jev.probe.cloud.ReviewPersonChoice
+import com.jev.probe.cloud.ReviewTitle
+import com.jev.probe.core.Analysis
 import com.jev.probe.core.ChatSnapshot
 import com.jev.probe.core.Prefs
+import com.jev.probe.core.WorkScope
 import com.jev.probe.core.kb.*
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,11 +35,25 @@ class ContactRepository(context: Context, val session: CloudSession) {
     }
     fun contact(id: String): Contact? = contacts().firstOrNull { it.id == id }
     fun findContact(title: String, app: String): Contact? {
+        if (!ReviewTitle.reliable(title)) return null
+        val normalized = ReviewTitle.display(title)
         // Only explicitly assigned identities match. Downloaded equal names never silently merge.
         val links = db.records("identity_links").map { payload(it) }
-        val uid = links.lastOrNull { it.optString("platform") == app && it.optString("legacy_id") == title &&
+        val uid = links.lastOrNull { it.optString("platform") == app && ReviewTitle.display(it.optString("legacy_id")) == normalized &&
             it.optString("source_device") == sourceDevice }?.optString("profile_uid")
         return uid?.let { contact(it) }
+    }
+    /** Account/device checks live in CloudRuntime; verify both person ownership and the selected chat here. */
+    fun analysisCurrent(analysis: Analysis, title: String?, app: String): Boolean {
+        val profile = analysis.cloudProfileUid ?: return false
+        if (contact(profile) == null) return false
+        val row = db.record("conversations", analysis.conversationUid ?: "") ?: return false
+        if (!row.isNull("deleted_at")) return false
+        val payload = row.optJSONObject("payload") ?: return false
+        if (payload.optString("profile_uid") != profile || payload.optString("platform") != app ||
+            ReviewTitle.display(payload.optString("title")) != ReviewTitle.display(title) || payload.optInt("context_revision", -1) != analysis.contextRevision) return false
+        return if (ReviewTitle.reliable(title)) findContact(ReviewTitle.display(title), app)?.id == profile
+        else !analysis.cloudReviewUid.isNullOrBlank() && payload.optString("review_scope") == analysis.cloudReviewUid
     }
     fun saveContact(c: Contact): Boolean {
         db.transaction { sql ->
@@ -52,15 +70,16 @@ class ContactRepository(context: Context, val session: CloudSession) {
         db.transaction { sql -> replaceIdentity(sql, id, title, app) }
     }
     private fun replaceIdentity(sql: android.database.sqlite.SQLiteDatabase, person: String, title: String, app: String) {
+        val normalized = ReviewTitle.display(title)
         val previous = db.records("identity_links").filter { r -> payload(r).let {
-            it.optString("source_device") == sourceDevice && it.optString("platform") == app && it.optString("legacy_id") == title
+            it.optString("source_device") == sourceDevice && it.optString("platform") == app && ReviewTitle.display(it.optString("legacy_id")) == normalized
         } }
         val mapped = db.legacyUid("identity/$sourceDevice/$app/$title", sql)
         val uid = previous.lastOrNull()?.getString("uid") ?: if (db.record("identity_links", mapped)?.isNull("deleted_at") == false)
             UUID.randomUUID().toString() else mapped
         for (old in previous) if (old.getString("uid") != uid) db.edit(sql, "identity_links", old.getString("uid"), payload(old), true)
         db.edit(sql, "identity_links", uid, JSONObject().put("profile_uid", person).put("platform", app)
-            .put("legacy_id", title).put("source_device", sourceDevice))
+            .put("legacy_id", normalized).put("source_device", sourceDevice))
     }
     fun saveOrMergeContact(title: String, app: String): String {
         if (findContact(title, app) != null) return "当前聊天已关联云联系人"
@@ -94,19 +113,47 @@ class ContactRepository(context: Context, val session: CloudSession) {
     }
     /** Called only after the existing raw-text review was confirmed by the user. */
     fun confirm(snapshot: ChatSnapshot, app: String, source: ChatSnapshot, binding: CloudAccountBinding,
-        expectedProfileUid: String? = null): Pair<String, String> = binding.withCurrent { db.transaction {
+        expectedProfileUid: String? = null, selection: ReviewPersonChoice? = null, reviewUid: String? = null): Pair<String, String> = binding.withCurrent { db.transaction { sql ->
+        WorkScope.checkActive()
         check(binding.session.accountKey == session.accountKey && binding.session.deviceId == session.deviceId) { "核对账号与资料库不匹配" }
-        val title = snapshot.title?.takeIf { it.isNotBlank() } ?: "已确认对话"
-        val person = findContact(title, app)
-            ?: error("此聊天尚未关联云人物。请长按悬浮球选择保存联系人，在云账号页选已有云人物或明确新建，再返回核对分析。")
-        check(expectedProfileUid == null || person.id == expectedProfileUid) { "核对期间人物关联已改变，请重新识别并核对" }
-        val conversation = db.transaction { sql ->
-            val uid = db.legacyUid("conversation/${person.id}/$app/$title", sql)
+        val title = ReviewTitle.display(snapshot.title)
+        val reliable = ReviewTitle.reliable(snapshot.title)
+        val previous = findContact(title, app)
+        check(if (selection != null) previous?.id == expectedProfileUid else expectedProfileUid == null || previous?.id == expectedProfileUid) {
+            "核对期间人物关联已改变，请重新识别并核对"
+        }
+        val person = if (selection == null) previous ?: error("请在本轮核对页选择已有联系人或明确新建人物") else {
+            check((selection.profileUid != null) != (selection.newName != null)) { "请选择已有联系人或明确新建人物" }
+            if (selection.profileUid != null) contact(selection.profileUid) ?: error("所选人物已删除，请重新核对")
+            else {
+                val name = selection.newName.orEmpty().trim()
+                check(name.isNotEmpty() && name.codePointCount(0, name.length) <= 200) { "请填写 1 至 200 字的新人物称呼" }
+                val uid = db.legacyUid("review-person/${checkNotNull(reviewUid)}", sql)
+                contact(uid) ?: Contact(uid, name).also { saveContact(it) }
+            }
+        }
+        if (selection != null && reliable) replaceIdentity(sql, person.id, title, app)
+        if (!reliable) check(selection != null && !reviewUid.isNullOrBlank()) { "标题未确认，请在本轮主动选择人物" }
+        val conversation = run {
+            // Existing v1 titles were not trimmed. Preserve their conversation and durable request IDs.
+            val matches = if (reliable) db.records("conversations").filter { row -> payload(row).let {
+                it.optString("profile_uid") == person.id && it.optString("platform") == app &&
+                    ReviewTitle.display(it.optString("title")) == title && it.optString("review_scope").isBlank()
+            } } else emptyList()
+            check(matches.size <= 1) { "此人物存在多个同名会话，请先在云账号页查看并恢复原任务，再重新核对；未新建分析任务" }
+            val uid = matches.singleOrNull()?.getString("uid") ?: db.legacyUid(
+                if (reliable) "conversation/${person.id}/$app/$title" else "review-conversation/$reviewUid", sql)
             if (db.record("conversations", uid) == null) db.edit(sql, "conversations", uid, JSONObject()
-                .put("profile_uid", person.id).put("title", title).put("platform", app).put("context_revision", 0))
+                .put("profile_uid", person.id).put("title", title).put("platform", app).put("context_revision", 0).apply {
+                    if (!reliable) put("review_scope", reviewUid)
+                })
+            val existing = db.record("conversations", uid)!!
+            val context = existing.getJSONObject("payload")
+            check(existing.isNull("deleted_at") && context.optString("profile_uid") == person.id &&
+                context.optString("platform") == app && ReviewTitle.display(context.optString("title")) == title) { "会话人物已改变，请重新核对" }
             uid
         }
-        db.transaction { sql ->
+        run {
             val metaKey = "screen/$conversation"
             val prev = db.meta(metaKey)?.let { raw -> JSONArray(raw).let { a -> (0 until a.length()).map { a.getString(it) } } } ?: emptyList()
             val screen = snapshot.messages.map { "${it.side}\u0000${it.text}" }
@@ -144,6 +191,7 @@ class ContactRepository(context: Context, val session: CloudSession) {
             sql.execSQL("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", arrayOf("screen_source/$conversation", sourceJson))
             sql.execSQL("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", arrayOf("screen_rows/$conversation", rows.toString()))
         }
+        WorkScope.checkActive()
         person.id to conversation
     } }
 }
